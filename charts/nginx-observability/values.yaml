@@ -1,0 +1,37 @@
+namespace: ns-dpn-health-01
+
+name: dpn-nginx-observability-health
+
+image:
+  repository: nginx
+  tag: "1.27-alpine"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# Plain internal LoadBalancer — same pattern every other service in this
+# repo already uses successfully. No Ingress, no ingress controller, no
+# TLS/hostname needed.
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# -----------------------------------------------------------------------
+# Basic auth — the dpn-nginx-basic-auth Secret is created MANUALLY via
+# kubectl, not by this chart, so the credential (even hashed) never sits
+# in the repo. See the deploy runbook / README for the exact command.
+# This chart only references the secret by name; createSecret is kept
+# here only so a future contributor doesn't accidentally re-add a
+# hardcoded credential — leave it false.
+# -----------------------------------------------------------------------
+basicAuth:
+  createSecret: false

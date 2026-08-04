@@ -1,0 +1,162 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+  # resource:
+  #   attributes:
+  #     - key: environment
+  #       value: development
+  #       action: upsert
+
+  resource:
+    attributes:
+      - key: cluster
+        value: {{ required "clusterName is required. Pass it using --set clusterName=<aks-cluster-name>" .Values.clusterName | quote }}
+        action: upsert
+
+      - key: environment
+        value: {{ .Values.environment | default "development" | quote }}
+        action: upsert
+
+
+  # Sample traces (10%)
+  probabilistic_sampler:
+    sampling_percentage: 100
+
+  # Redact sensitive information from log bodies using OTTL (redaction processor is traces-only)
+  transform/logs_redaction:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - 'replace_pattern(body, "(?i)api[_-]?key\\s*[:=]\\s*[a-zA-Z0-9_\\-]{20,}", "[REDACTED_API_KEY]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)access[_-]?token\\s*[:=]\\s*[a-zA-Z0-9_\\-\\.]{20,}", "[REDACTED_TOKEN]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)bearer\\s+[a-zA-Z0-9_\\-\\.]{20,}", "[REDACTED_BEARER]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)\\btoken\\s*[:=]\\s*[a-zA-Z0-9_\\-\\.]{20,}", "[REDACTED_TOKEN]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)(password|passwd|pwd)\\s*[:=]\\s*\\S{8,}", "[REDACTED_PASSWORD]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)pass\\s*[:=]\\s*\\S{8,}", "[REDACTED_PASSWORD]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)secret[_-]?key\\s*[:=]\\s*[a-zA-Z0-9_\\-]{16,}", "[REDACTED_SECRET]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)client[_-]?secret\\s*[:=]\\s*[a-zA-Z0-9_\\-]{20,}", "[REDACTED_SECRET]") where IsString(body)'
+          - 'replace_pattern(body, "AKIA[0-9A-Z]{16}", "[REDACTED_AWS_KEY]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)aws[_-]?secret[_-]?access[_-]?key\\s*[:=]\\s*[a-zA-Z0-9/+=]{40}", "[REDACTED_AWS_SECRET]") where IsString(body)'
+          - 'replace_pattern(body, "eyJ[a-zA-Z0-9_-]+\\.eyJ[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+", "[REDACTED_JWT]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)(mongodb|mysql|postgresql|postgres|redis)://[^\\s@]+:[^\\s@]+@\\S+", "[REDACTED_DB_URL]") where IsString(body)'
+          - 'replace_pattern(body, "\\b(?:\\d{4}[\\s-]?){3}\\d{4}\\b", "[REDACTED_CC]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)authorization\\s*:\\s*\\S+", "[REDACTED_AUTH]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)credentials?\\s*[:=]\\s*\\S{10,}", "[REDACTED_CRED]") where IsString(body)'
+          - 'replace_pattern(body, "(?i)\\bauth\\s*[:=]\\s*[a-zA-Z0-9_\\-]{16,}", "[REDACTED_AUTH]") where IsString(body)'
+          - 'replace_pattern(body, "AccountKey=[a-zA-Z0-9/+=]+", "AccountKey=[REDACTED]") where IsString(body)'
+      - context: resource
+        statements:
+          - 'replace_pattern(attributes["connection.secret"], "AccountKey=[a-zA-Z0-9/+=]+", "AccountKey=[REDACTED]") where IsString(attributes["connection.secret"])'
+      - context: scope
+        statements:
+          - 'replace_pattern(attributes["connection.secret"], "AccountKey=[a-zA-Z0-9/+=]+", "AccountKey=[REDACTED]") where IsString(attributes["connection.secret"])'
+
+  # Redact sensitive information from metrics attributes
+  transform/metrics_redaction:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - 'replace_pattern(attributes["connection.secret"], "AccountKey=[a-zA-Z0-9/+=]+", "AccountKey=[REDACTED]") where IsString(attributes["connection.secret"])'
+      - context: datapoint
+        statements:
+          - 'replace_pattern(attributes["connection.secret"], "AccountKey=[a-zA-Z0-9/+=]+", "AccountKey=[REDACTED]") where IsString(attributes["connection.secret"])'
+
+  # Redact sensitive information from traces
+  redaction:
+    allow_all_keys: true
+    blocked_values:
+      - "(?i)(api[_-]?key|apikey)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{20,})['\"]?"
+      - "(?i)(access[_-]?token|accesstoken)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-\\.]{20,})['\"]?"
+      - "(?i)(bearer\\s+)([a-zA-Z0-9_\\-\\.]{20,})"
+      - "(?i)(token)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-\\.]{20,})['\"]?"
+      - "(?i)(password|passwd|pwd)\\s*[:=]\\s*['\"]?([^\\s'\"]{8,})['\"]?"
+      - "(?i)(pass)\\s*[:=]\\s*['\"]?([^\\s'\"]{8,})['\"]?"
+      - "(?i)(secret|secret[_-]?key)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{16,})['\"]?"
+      - "(?i)(client[_-]?secret)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{20,})['\"]?"
+      - "(?i)(aws[_-]?access[_-]?key[_-]?id)\\s*[:=]\\s*['\"]?(AKIA[0-9A-Z]{16})['\"]?"
+      - "(?i)(aws[_-]?secret[_-]?access[_-]?key)\\s*[:=]\\s*['\"]?([a-zA-Z0-9/+=]{40})['\"]?"
+      # Azure Storage / Service Bus / Event Hub connection strings, e.g.
+      # "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=<secret>;EndpointSuffix=..."
+      - "(?i)DefaultEndpointsProtocol=[^;]+;AccountName=[^;]+;AccountKey=[a-zA-Z0-9+/=]{20,}"
+      # Generic catch-all for any "<word>Key=" / "<word>Secret=" / "SharedAccessSignature=" style
+      # value inside a semicolon-delimited connection string (covers AccountKey, SharedAccessKey,
+      # ApiKey, ClientSecret, etc. that the more specific rules above don't spell out)
+      - "(?i)[a-z]*(?:key|secret|signature)\\s*=\\s*['\"]?([a-zA-Z0-9+/_\\-]{16,}={0,2})['\"]?"
+      - "eyJ[a-zA-Z0-9_-]*\\.eyJ[a-zA-Z0-9_-]*\\.[a-zA-Z0-9_-]*"
+      - "(?i)(mongodb|mysql|postgresql|postgres|redis)://[^\\s@]+:[^\\s@]+@[^\\s]+"
+      - "\\b(?:\\d{4}[\\s-]?){3}\\d{4}\\b"
+      - "(?i)(authorization)\\s*:\\s*['\"]?([^\\s'\"]+)['\"]?"
+      - "(?i)(credentials?)\\s*[:=]\\s*['\"]?([^\\s'\"]{10,})['\"]?"
+      - "(?i)(auth)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{16,})['\"]?"
+      - "AccountKey=[a-zA-Z0-9/+=]+"
+    summary: debug
+
+exporters:
+  kafka/metrics:
+    brokers:
+      - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+    topic: otel-metrics
+    encoding: otlp_json
+    protocol_version: 2.0.0
+
+  prometheusremotewrite/metrics:
+    endpoint: "http://dpn-prometheus-health:9090/api/v1/write"
+    tls:
+      insecure: true
+
+  kafka/logs:
+    brokers:
+      - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+    topic: otel-logs
+    encoding: otlp_json 
+    protocol_version: 2.0.0
+
+  kafka/traces:
+    brokers:
+      - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+    topic: otel-traces
+    encoding: jaeger_proto
+    protocol_version: 2.0.0
+
+  # Debug exporter (console output)
+  logging:
+    loglevel: debug
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /healthz
+
+service:
+  extensions:
+    - health_check
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, resource, redaction]
+      exporters: [kafka/traces, logging]
+
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource, transform/metrics_redaction]
+      exporters: [kafka/metrics, prometheusremotewrite/metrics, logging]
+
+    logs:
+      receivers: [otlp]
+      processors: [resource, transform/logs_redaction]
+      exporters: [kafka/logs, logging]
+
+# Made with Bob

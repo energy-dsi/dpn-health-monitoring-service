@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dpn-perses
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: perses
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: perses
+      app.kubernetes.io/instance: {{ .Release.Name }}
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: perses
+        app.kubernetes.io/instance: {{ .Release.Name }}
+
+    spec:
+      securityContext:
+        fsGroup: 2000
+
+      containers:
+        - name: perses
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          args:
+            - --config=/etc/perses/config/config.yaml
+            - --web.listen-address=:8080
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 2000
+
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/perses/config
+              readOnly: true
+
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+
+      volumes:
+        - name: config
+          configMap:
+            name: dpn-perses
+
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.name }}

@@ -1,0 +1,36 @@
+namespace: ns-dpn-health-01
+
+image:
+  repository: thanosio/thanos
+  tag: v0.34.0
+  pullPolicy: IfNotPresent
+
+query:
+  name: dpn-thanos-query-health
+  replicas: 1
+
+  httpPort: 9091
+  grpcPort: 10903
+
+  service:
+    type: ClusterIP
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+sidecar:
+  serviceName: dpn-thanos-sidecar-health
+  externalName: dpn-prometheus-kube-promet-thanos-discovery.ns-dpn-health-01.svc.cluster.local
+  grpcPort: 10901
+  httpPort: 10902
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534

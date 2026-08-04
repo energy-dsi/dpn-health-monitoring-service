@@ -1,0 +1,73 @@
+
+fullnameOverride: dpn-opensearch-health
+masterService: dpn-opensearch-health
+
+
+singleNode: true
+replicas: 1
+
+image:
+  repository: "opensearchproject/opensearch"
+  tag: "2.11.0"
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "2Gi"
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
+
+opensearchJavaOpts: "-Xms2g -Xmx2g"
+
+persistence:
+  enabled: true
+  storageClass: "managed-premium"
+  size: 100Gi
+  enableInitChown: false
+
+config:
+  opensearch.yml: |
+    cluster.name: dpn-prod-observability
+    network.host: 0.0.0.0
+
+    plugins.security.disabled: true
+
+    cluster.routing.allocation.disk.threshold_enabled: true
+    cluster.routing.allocation.disk.watermark.low: 85%
+    cluster.routing.allocation.disk.watermark.high: 90%
+    cluster.routing.allocation.disk.watermark.flood_stage: 95%
+
+    action.auto_create_index: true
+    indices.query.bool.max_clause_count: 10000
+
+service:
+  type: ClusterIP
+  httpPort: 9200
+  transportPort: 9300
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+antiAffinity: "soft"
+
+extraEnvs:
+  - name: DISABLE_INSTALL_DEMO_CONFIG
+    value: "true"
+  - name: DISABLE_SECURITY_PLUGIN
+    value: "true"
+
+prometheus:
+  enabled: true

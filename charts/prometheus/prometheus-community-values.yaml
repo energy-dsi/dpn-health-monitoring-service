@@ -1,0 +1,221 @@
+# Prometheus + Thanos Community Chart - DPN01 Configuration
+# Use with:
+# helm upgrade --install dpn-prometheus prometheus-community/kube-prometheus-stack \
+#   -n ns-dpn-health-01 \
+#   -f charts/prometheus-community-values-dpn01.yaml \
+#   --wait \
+#   --timeout 15m
+
+global:
+  rbac:
+    create: true
+
+prometheusOperator:
+  enabled: true
+  fullnameOverride: dpn-prometheus-operator
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+prometheus:
+  enabled: true
+  fullnameOverride: dpn-prometheus-prometheus
+
+  service:
+    type: ClusterIP
+    port: 9090
+    targetPort: 9090
+    annotations: {}
+
+  thanosService:
+    enabled: true
+    type: ClusterIP
+    portName: grpc
+    port: 10901
+    targetPort: grpc
+    httpPortName: http
+    httpPort: 10902
+    targetHttpPort: http
+
+  prometheusSpec:
+    replicas: 2
+
+    retention: 7d
+    retentionSize: "50GB"
+
+    resources:
+      requests:
+        cpu: 1000m
+        memory: 4Gi
+      limits:
+        cpu: 4000m
+        memory: 8Gi
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: managed-premium
+          resources:
+            requests:
+              storage: 100Gi
+
+    thanos:
+          image: quay.io/thanos/thanos:v0.34.0
+          version: v0.34.0
+          objectStorageConfig:
+            existingSecret:
+              name: dpn-mon-storage-connection-string
+              key: objstore.yml
+
+    # kube-prometheus-stack labels its own ServiceMonitors/PodMonitors with
+    # release: dpn-prometheus. Selecting on `prometheus: kube-prometheus` matched
+    # nothing, so Prometheus scraped only additionalScrapeConfigs (telegraf) and
+    # missed kubelet/node/apiserver/kube-state-metrics. Match the real label.
+    serviceMonitorSelector:
+      matchLabels:
+        release: dpn-prometheus
+
+    podMonitorSelector:
+      matchLabels:
+        release: dpn-prometheus
+
+    additionalScrapeConfigs:
+      - job_name: telegraf-metrics
+        kubernetes_sd_configs:
+          - role: service
+            namespaces:
+              names:
+                - ns-dpn-health-01
+        relabel_configs:
+          - source_labels:
+              - __meta_kubernetes_service_annotation_prometheus_io_scrape
+            action: keep
+            regex: true
+          - source_labels:
+              - __meta_kubernetes_service_annotation_prometheus_io_path
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              - __address__
+              - __meta_kubernetes_service_annotation_prometheus_io_port
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - prometheus
+              topologyKey: kubernetes.io/hostname
+
+alertmanager:
+  enabled: true
+
+  alertmanagerSpec:
+    replicas: 2
+    retention: 120h
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: managed-premium
+          resources:
+            requests:
+              storage: 10Gi
+
+    fullnameOverride: dpn-prometheus-alertmanager
+
+grafana:
+  enabled: false
+
+# IMPORTANT:
+# Disable node-exporter because the DaemonSet is not scheduling in AKS.
+# Without this, Helm waits forever on:
+# dpn-prometheus-prometheus-node-exporter
+prometheus-node-exporter:
+  enabled: false
+
+nodeExporter:
+  enabled: false
+
+kubeStateMetrics:
+  enabled: true
+  fullnameOverride: dpn-prometheus-statemetrics
+
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserver: true
+    kubeApiserverAvailability: true
+    kubeApiserverSlos: true
+    kubelet: true
+    kubeProxy: true
+    kubePrometheusGeneral: true
+
+    # Disabled because node-exporter is disabled.
+    kubePrometheusNodeRecording: false
+    node: false
+    nodeExporterAlerting: false
+    nodeExporterRecording: false
+
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    network: true
+    prometheus: true
+    prometheusOperator: true
+
+extraManifests:
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: dpn-prometheus-health-ui
+      namespace: ns-dpn-health-01
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/instance: dpn-prometheus
+        app.kubernetes.io/component: prometheus-ui
+    spec:
+      type: ClusterIP
+      selector:
+        app.kubernetes.io/name: prometheus
+        prometheus: dpn-prometheus-kube-promet-prometheus
+      ports:
+        - name: http
+          port: 9090
+          targetPort: 9090
+          protocol: TCP

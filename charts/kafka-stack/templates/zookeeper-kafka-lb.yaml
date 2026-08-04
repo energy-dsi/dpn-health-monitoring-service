@@ -1,0 +1,64 @@
+{{- if and .Values.kafka.enabled .Values.kafkaUi.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.kafkaUi.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafkaUi.name }}
+spec:
+  replicas: {{ .Values.kafkaUi.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.kafkaUi.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.kafkaUi.name }}
+    spec:
+      containers:
+        - name: kafka-ui
+          image: "{{ .Values.kafkaUi.image.repository }}:{{ .Values.kafkaUi.image.tag }}"
+          imagePullPolicy: {{ .Values.kafkaUi.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+{{- range $key, $value := .Values.kafkaUi.env }}
+            - name: {{ $key }}
+              value: "{{ $value }}"
+{{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.kafkaUi.service.targetPort }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.kafkaUi.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafkaUi.name }}
+  annotations:
+{{ toYaml .Values.kafkaUi.service.annotations | indent 4 }}
+spec:
+  type: {{ .Values.kafkaUi.service.type }}
+  selector:
+    app: {{ .Values.kafkaUi.name }}
+  ports:
+    - name: http
+      port: {{ .Values.kafkaUi.service.port }}
+      targetPort: {{ .Values.kafkaUi.service.targetPort }}
+      protocol: TCP
+{{- end }}

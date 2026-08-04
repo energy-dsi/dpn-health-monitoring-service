@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+data:
+  nginx.conf: |
+{{ tpl (.Files.Get "nginx-observability.conf") . | indent 4 }}

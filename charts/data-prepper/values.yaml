@@ -1,0 +1,45 @@
+namespace: ns-dpn-health-01
+
+name: dpn-data-prepper-health
+replicaCount: 1
+
+
+image:
+  repository: opensearchproject/data-prepper
+  tag: "2.6.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 4900
+
+kafka:
+  brokers:
+    - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+
+opensearch:
+  hosts:
+    - http://dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop:
+      - ALL

@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.name }}
+    spec:
+      containers:
+        - name: nginx
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          ports:
+            - name: kafka-ui
+              containerPort: 8082
+            - name: opensearch
+              containerPort: 5601
+            - name: jaeger
+              containerPort: 16686
+            - name: prometheus
+              containerPort: 9081
+            - name: thanos
+              containerPort: 9091
+            - name: perses
+              containerPort: 8083
+            - name: airflow
+              containerPort: 8084
+            - name: kafka-ui-2
+              containerPort: 8086
+
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+
+            - name: nginx-basic-auth
+              mountPath: /etc/nginx/auth
+              readOnly: true
+
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: {{ .Values.name }}
+
+        - name: nginx-basic-auth
+          secret:
+            secretName: dpn-nginx-basic-auth

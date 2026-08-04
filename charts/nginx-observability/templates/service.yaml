@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+  annotations:
+{{ toYaml .Values.service.annotations | indent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Values.name }}
+  ports:
+    - name: kafka-ui
+      port: 8082
+      targetPort: 8082
+      protocol: TCP
+
+    - name: opensearch
+      port: 5601
+      targetPort: 5601
+      protocol: TCP
+
+    - name: jaeger
+      port: 16686
+      targetPort: 16686
+      protocol: TCP
+
+    - name: prometheus
+      port: 9081
+      targetPort: 9081
+      protocol: TCP
+
+    - name: thanos
+      port: 9091
+      targetPort: 9091
+      protocol: TCP
+
+    - name: perses
+      port: 8083
+      targetPort: 8083
+      protocol: TCP
+
+    - name: airflow
+      port: 8084
+      targetPort: 8084
+      protocol: TCP
+
+    - name: kafka-ui-2
+      port: 8086
+      targetPort: 8086
+      protocol: TCP      

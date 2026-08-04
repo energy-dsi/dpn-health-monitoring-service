@@ -1,0 +1,218 @@
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+jobs:
+- deployment: DeployNginxObservability
+  displayName: Deploy Nginx Observability Proxy
+  ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    environment: dsi-ppd
+  ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    environment: dsi-devtest
+  ${{ else }}:
+    environment: dsi-dev
+
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
+
+        - task: AzureCLI@2
+          displayName: Deploy Nginx Observability
+          inputs:
+            azureSubscription: ${{ parameters.ServiceConnection }}
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              set -euo pipefail
+
+              if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+                echo "ERROR: Environment '${{ parameters.environment }}' is configured for a single-DPN deployment and does not support cluster '${{ parameters.cluster }}'."
+                exit 1
+              fi
+
+              CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+              CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+
+              RELEASE_NAME="dpn-nginx-observability"
+              CHART_DIR="$(Build.SourcesDirectory)/charts/nginx-observability"
+
+              echo "CONFIG_FILE=$CONFIG_FILE"
+              echo "CHART_DIR=$CHART_DIR"
+              echo "RELEASE_NAME=$RELEASE_NAME"
+
+              if [ ! -f "$CONFIG_FILE" ]; then
+                if [ -f "$CONFIG_FILE_CLUSTER" ]; then
+                  CONFIG_FILE="$CONFIG_FILE_CLUSTER"
+                else
+                  echo "Config file missing: $CONFIG_FILE"
+                  exit 1
+                fi
+              fi
+
+              export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+              echo "RESOURCE_GROUP=$RESOURCE_GROUP"
+              echo "AKS_CLUSTER=$AKS_CLUSTER"
+              echo "NAMESPACE=$NAMESPACE"
+
+              az aks install-cli --kubelogin-version v0.2.19
+              az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+              az aks get-credentials \
+                --resource-group "$RESOURCE_GROUP" \
+                --name "$AKS_CLUSTER" \
+                --overwrite-existing
+              kubelogin convert-kubeconfig -l azurecli
+
+              echo "Checking namespace..."
+              kubectl get namespace "$NAMESPACE"
+
+              echo "========================================"
+              echo "Checking for manually-created auth secret"
+              echo "========================================"
+
+              # dpn-nginx-basic-auth is created manually via kubectl (not by
+              # this chart), specifically so the credential never sits in
+              # the repo, hashed or not. This chart must NEVER create,
+              # adopt, or delete it — only fail loudly if it's missing, so
+              # someone creates it before the Deployment starts crash-looping
+              # on a missing volume mount.
+              if ! kubectl get secret dpn-nginx-basic-auth -n "$NAMESPACE" >/dev/null 2>&1; then
+                echo "ERROR: secret/dpn-nginx-basic-auth not found in namespace $NAMESPACE."
+                echo "Create it manually first, e.g.:"
+                echo "  kubectl create secret generic dpn-nginx-basic-auth \\"
+                echo "    --from-file=.htpasswd=config/nginx/.htpasswd \\"
+                echo "    -n $NAMESPACE"
+                exit 1
+              fi
+              echo "secret/dpn-nginx-basic-auth found. Continuing."
+
+              echo "========================================"
+              echo "Linting nginx-observability chart"
+              echo "========================================"
+
+              helm lint "$CHART_DIR"
+
+              echo "========================================"
+              echo "Rendering nginx-observability chart"
+              echo "========================================"
+
+              helm template "$RELEASE_NAME" "$CHART_DIR" \
+                --namespace "$NAMESPACE" \
+                --debug > /tmp/nginx-observability-rendered.yaml
+
+              grep "^kind:" /tmp/nginx-observability-rendered.yaml || true
+
+              echo "========================================"
+              echo "Verifying expected backend Services exist"
+              echo "========================================"
+
+              for SVC in \
+                dpn-kafka-health-ui \
+                dpn-opensearch-dashboard-health \
+                dpn-jaeger-query-health \
+                dpn-prometheus-health-ui \
+                dpn-thanos-query-health \
+                dpn-perses-health; do
+                echo "Checking svc/$SVC"
+                kubectl get svc "$SVC" -n "$NAMESPACE"
+              done
+
+              echo "========================================"
+              echo "Deploying nginx-observability"
+              echo "========================================"
+
+              helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+                --namespace "$NAMESPACE" \
+                --wait \
+                --timeout 5m \
+                --atomic \
+                --debug
+
+              echo "========================================"
+              echo "nginx-observability resources"
+              echo "========================================"
+
+              kubectl get svc dpn-nginx-observability-health -n "$NAMESPACE"
+              kubectl get pods -n "$NAMESPACE" -l app=dpn-nginx-observability-health
+
+              echo "========================================"
+              echo "Testing each port via the internal LoadBalancer"
+              echo "========================================"
+              # NGINX_AUTH_PASSWORD must be defined as a SECRET pipeline
+              # variable (Pipeline > Edit > Variables, "keep this value
+              # secret" checked, or a Variable Group / Azure Key Vault
+              # linked variable) — never as plain text in this file or a
+              # values.yaml. It only needs to match whatever admin
+              # password was used when the dpn-nginx-basic-auth secret
+              # was created manually (see the pre-flight check above).
+
+              LB_IP="$(kubectl get svc dpn-nginx-observability-health -n "$NAMESPACE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+
+              echo "Nginx observability internal LB IP: ${LB_IP:-<pending>}"
+
+              if [ -n "$LB_IP" ]; then
+                kubectl delete pod nginx-observability-curl-test -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s
+
+                declare -A PORTS=(
+                  [kafka-ui]=8082
+                  [opensearch]=5601
+                  [jaeger]=16686
+                  [prometheus]=9081
+                  [thanos]=9091
+                  [perses]=8083
+                )
+
+                for NAME in "${!PORTS[@]}"; do
+                  PORT="${PORTS[$NAME]}"
+                  echo "-- $NAME (port $PORT) --"
+                  kubectl run nginx-observability-curl-test -n "$NAMESPACE" \
+                    --image=curlimages/curl:8.8.0 \
+                    --restart=Never \
+                    --rm \
+                    --attach \
+                    --command -- sh -c "curl -su admin:$(NGINX_AUTH_PASSWORD) -o /dev/null -w '%{http_code}\n' http://$LB_IP:$PORT/ || true"
+                done
+              else
+                echo "LB IP not yet assigned, skipping live port curl tests."
+              fi
+
+              echo "nginx-observability deployment completed."

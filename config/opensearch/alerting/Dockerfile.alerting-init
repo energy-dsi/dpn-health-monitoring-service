@@ -1,0 +1,5 @@
+FROM curlimages/curl:8.6.0
+USER root
+COPY init-opensearch-alerting.sh /init.sh
+RUN chmod +x /init.sh
+ENTRYPOINT ["sh", "/init.sh"]

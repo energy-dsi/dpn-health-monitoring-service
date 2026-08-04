@@ -1,0 +1,12 @@
+kind: GlobalDatasource
+metadata:
+  name: thanos
+spec:
+  default: true
+  plugin:
+    kind: PrometheusDatasource
+    spec:
+      proxy:
+        kind: HTTPProxy
+        spec:
+          url: http://dpn-thanos-query-health:9091

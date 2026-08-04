@@ -1,0 +1,12 @@
+{
+  "ENV_NAME": "<<YOUR ENV_NAME>>",
+  "CONTAINER_REGISTRY": "<<YOUR CONTAINER_REGISTRY>>",
+  "CONTAINER_REGISTRY_URL": "<<YOUR CONTAINER_REGISTRY_URL>>",
+  "BASE_REGISTRY": "<<GHCR REGISTRY NAME>>",
+  "AZURE_SUBSCRIPTION_ID": "<<Your Subscrpition ID>>",
+  "RESOURCE_GROUP": "<<YOUR RESOURCE_GROUP NAME>>",
+  "AKS_CLUSTER": "<<YOUR AKS_CLUSTER NAME>>",
+  "NAMESPACE": "ns-dpn-health-01",
+  "KEY_VAULT_NAME": "<<Your KEY_VAULT_NAME>>",
+  "KAFKA_BROKER": "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092"
+}

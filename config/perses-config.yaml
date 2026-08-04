@@ -1,0 +1,22 @@
+# Perses Configuration for DPN Observability
+
+database:
+  file:
+    folder: /var/lib/perses
+    extension: json
+
+security:
+  enable_auth: false
+  encryption_key: "dpn-observability-secret-key-32b"
+
+schemas:
+  panels_path: /etc/perses/cue/schemas/panels
+  queries_path: /etc/perses/cue/schemas/queries
+  datasources_path: /etc/perses/cue/schemas/datasources
+  variables_path: /etc/perses/cue/schemas/variables
+
+provisioning:
+  folders:
+    - /etc/perses/provisioning
+
+# Made with Bob

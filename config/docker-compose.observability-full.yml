@@ -1,0 +1,405 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # OPENTELEMETRY COLLECTOR
+  # ============================================================================
+  
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.95.0
+    container_name: dpn-otel-collector-health
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+      - "13133:13133" # Health check
+    networks:
+      - dpn-network
+    depends_on:
+      dpn-kafka-health:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # KAFKA INFRASTRUCTURE
+  # ============================================================================
+  
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: dpn-zookeeper-health
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - dpn-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dpn-kafka-health:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: dpn-kafka-health
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      # - "9092:9092"
+      - "19092:19092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: dpn-zookeeper-health:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://dpn-kafka-health:29092,PLAINTEXT_HOST://localhost:9092,PLAINTEXT_INTERNAL://dpn-kafka-health:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    networks:
+      - dpn-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dpn-kafka-ui-health
+    # Port exposed via nginx proxy only — not directly on host
+    expose:
+      - "8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: dpn-local-health
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: dpn-kafka-health:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: dpn-zookeeper-health:2181
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - dpn-network
+    depends_on:
+      dpn-kafka-health:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # OPENSEARCH - Storage for Logs and Traces
+  # ============================================================================
+  
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: dpn-opensearch-health
+    environment:
+      - cluster.name=dpn-observability
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "DISABLE_INSTALL_DEMO_CONFIG=true"
+      - "DISABLE_SECURITY_PLUGIN=true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    networks:
+      - dpn-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  opensearch-init:
+    image: curlimages/curl:latest
+    container_name: dpn-opensearch-init-health
+    networks:
+      - dpn-network
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: "no"
+    command: >
+      sh -c "curl -s -X PUT 'http://dpn-opensearch-health:9200/_index_template/otel-logs-template'
+      -H 'Content-Type: application/json'
+      -d '{\"index_patterns\":[\"otel-logs-*\"],\"priority\":10,\"template\":{\"settings\":{\"index\":{\"number_of_replicas\":\"0\"}},\"mappings\":{\"date_detection\":false,\"properties\":{\"@timestamp\":{\"type\":\"date\"},\"message\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":2048}}}},\"dynamic_templates\":[{\"strings_as_keyword\":{\"match_mapping_type\":\"string\",\"mapping\":{\"type\":\"keyword\",\"ignore_above\":1024}}}]}}}'"
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: dpn-opensearch-dashboards-health
+    # Port exposed via nginx proxy only — not directly on host
+    expose:
+      - "5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://dpn-opensearch-health:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+      OPENSEARCH_DASHBOARDS_DATEFORMAT_TZ: "UTC"
+    networks:
+      - dpn-network
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # DATA PREPPER - Logs Pipeline (Kafka -> OpenSearch)
+  # ============================================================================
+  
+  data-prepper:
+    image: opensearchproject/data-prepper:2.6.0
+    container_name: dpn-data-prepper-health
+    volumes:
+      - ./data-prepper-config.yaml:/usr/share/data-prepper/pipelines/pipelines.yaml
+      - ./data-prepper-data-prepper-config.yaml:/usr/share/data-prepper/config/data-prepper-config.yaml
+    ports:
+      - "4900:4900"
+    networks:
+      - dpn-network
+    depends_on:
+      dpn-kafka-health:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      opensearch-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ============================================================================
+  # JAEGER - Traces Pipeline
+  # ============================================================================
+  
+  jaeger-ingester:
+    image: jaegertracing/jaeger-ingester:1.54.0
+    container_name: dpn-jaeger-ingester-health
+    command:
+      - "--kafka.consumer.brokers=dpn-kafka-health:29092"
+      - "--kafka.consumer.topic=otel-traces"
+      - "--kafka.consumer.encoding=otlp_proto"
+      - "--kafka.consumer.group-id=jaeger-ingester"
+      - "--ingester.parallelism=1000"
+      - "--ingester.deadlockInterval=0"
+    environment:
+      - SPAN_STORAGE_TYPE=opensearch
+      - ES_SERVER_URLS=http://dpn-opensearch-health:9200
+    networks:
+      - dpn-network
+    depends_on:
+      dpn-kafka-health:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  jaeger-query:
+    image: jaegertracing/jaeger-query:1.54.0
+    container_name: dpn-jaeger-query-health
+    environment:
+      - SPAN_STORAGE_TYPE=opensearch
+      - ES_SERVER_URLS=http://dpn-opensearch-health:9200
+    # Ports exposed via nginx proxy only — not directly on host
+    expose:
+      - "16686"
+      - "16687"
+    networks:
+      - dpn-network
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # PROMETHEUS - Metrics Storage
+  # ============================================================================
+  
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: dpn-prometheus-health
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.enable-remote-write-receiver'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    # Port exposed via nginx proxy only — not directly on host
+    expose:
+      - "9090"
+    networks:
+      - dpn-network
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  # ============================================================================
+  # THANOS SIDECAR - Long-term Metrics Storage
+  # ============================================================================
+  
+  thanos-sidecar:
+    image: thanosio/thanos:v0.34.0
+    container_name: dpn-thanos-sidecar-health
+    command:
+      - 'sidecar'
+      - '--tsdb.path=/prometheus'
+      - '--prometheus.url=http://dpn-prometheus-health:9090'
+      - '--grpc-address=0.0.0.0:10901'
+      - '--http-address=0.0.0.0:10902'
+    volumes:
+      - prometheus-data:/prometheus
+    ports:
+      - "10901:10901"
+      - "10902:10902"
+    networks:
+      - dpn-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  thanos-query:
+    image: thanosio/thanos:v0.34.0
+    container_name: dpn-thanos-query-health
+    command:
+      - 'query'
+      - '--http-address=0.0.0.0:9091'
+      - '--grpc-address=0.0.0.0:10903'
+      - '--store=dpn-thanos-sidecar-health:10901'
+    # Ports exposed via nginx proxy only — not directly on host
+    expose:
+      - "9091"
+      - "10903"
+    networks:
+      - dpn-network
+    depends_on:
+      - thanos-sidecar
+    restart: unless-stopped
+
+  # ============================================================================
+  # PERSES - Unified Observability Dashboard
+  # ============================================================================
+  
+  perses:
+    image: persesdev/perses:v0.47.0
+    container_name: dpn-perses-health
+    user: "0:0"
+    # Port exposed via nginx proxy only — not directly on host
+    expose:
+      - "8080"
+    volumes:
+      - ./perses-config.yaml:/etc/perses/config.yaml
+      - ./provisioning:/etc/perses/provisioning
+      - perses-data:/var/lib/perses
+    networks:
+      - dpn-network
+    depends_on:
+      - thanos-query
+      - opensearch
+      - jaeger-query
+    restart: unless-stopped
+
+  # ============================================================================
+  # OPENSEARCH DASHBOARD INIT – imports saved objects on first start
+  # ============================================================================
+  opensearch-dashboard-init:
+    build:
+      context: ./opensearch/dashboard-provisioning
+      dockerfile: Dockerfile.dashboard-init
+    image: dpn-opensearch-dashboard-init:latest
+    container_name: dpn-opensearch-dashboard-init
+    environment:
+      DASHBOARDS_URL: "http://dpn-opensearch-dashboards-health:5601"
+      OPENSEARCH_URL: "http://dpn-opensearch-health:9200"
+    networks:
+      - dpn-network
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      opensearch-dashboards:
+        condition: service_started
+    restart: "no"
+
+  # ============================================================================
+  # OPENSEARCH ALERTING INIT – provisions failure-log email alert on first start
+  # ============================================================================
+  opensearch-alerting-init:
+    build:
+      context: ./opensearch/alerting
+      dockerfile: Dockerfile.alerting-init
+    image: dpn-opensearch-alerting-init:latest
+    container_name: dpn-opensearch-alerting-init
+    env_file:
+      - .env
+    environment:
+      OPENSEARCH_URL: "http://dpn-opensearch-health:9200"
+    networks:
+      - dpn-network
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: "no"
+
+  # ============================================================================
+  # NGINX REVERSE PROXY — Auth gateway for all UI services
+  # ============================================================================
+
+  nginx-auth-proxy:
+    image: nginx:1.27-alpine
+    container_name: dpn-nginx-auth-proxy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    ports:
+      - "8082:8082"   # Kafka UI
+      - "5601:5601"   # OpenSearch Dashboards
+      - "16686:16686" # Jaeger UI
+      - "9081:9081"   # Prometheus
+      - "9091:9091"   # Thanos Query
+      - "8083:8083"   # Perses
+    networks:
+      - dpn-network
+    depends_on:
+      - kafka-ui
+      - opensearch-dashboards
+      - jaeger-query
+      - prometheus
+      - thanos-query
+      - perses
+    restart: unless-stopped
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+
+volumes:
+  opensearch-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  perses-data:
+    driver: local
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+
+networks:
+  dpn-network:
+    driver: bridge
+    name: dpn-network
+
+# Made with Bob

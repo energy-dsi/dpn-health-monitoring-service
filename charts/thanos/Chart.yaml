@@ -1,0 +1,16 @@
+apiVersion: v2
+name: thanos
+description: Thanos Query for DPN observability health monitoring
+type: application
+version: 1.0.0
+appVersion: "0.34.0"
+
+keywords:
+  - thanos
+  - prometheus
+  - metrics
+  - query
+
+maintainers:
+  - name: DPN Team
+    email: dpn-team@example.com

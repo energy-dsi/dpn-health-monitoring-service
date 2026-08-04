@@ -1,0 +1,250 @@
+
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dpn-opensearch-health-ui
+  namespace: ns-dpn-health-01
+  labels:
+    app.kubernetes.io/name: opensearch
+    app.kubernetes.io/component: health-ui
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: dpn-opensearch
+    app.kubernetes.io/name: opensearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: 9200
+      protocol: TCP
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dpn-opensearch-init-health
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-init-health
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: dpn-opensearch-init-health
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: opensearch-init-health
+          image: curlimages/curl:8.8.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for OpenSearch health endpoint..."
+
+              until curl -fsS http://dpn-opensearch-health:9200/_cluster/health; do
+                echo "OpenSearch not ready yet..."
+                sleep 10
+              done
+
+              echo "Creating OTEL logs index template..."
+
+              curl -fsS -X PUT "http://dpn-opensearch-health:9200/_index_template/otel-logs-template" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "index_patterns": ["otel-logs-*"],
+                  "priority": 10,
+                  "template": {
+                    "settings": {
+                      "index": {
+                        "number_of_replicas": "0"
+                      }
+                    },
+                    "mappings": {
+                      "date_detection": false,
+                      "properties": {
+                        "@timestamp": {
+                          "type": "date"
+                        },
+                        "message": {
+                          "type": "text",
+                          "fields": {
+                            "keyword": {
+                              "type": "keyword",
+                              "ignore_above": 2048
+                            }
+                          }
+                        }
+                      },
+                      "dynamic_templates": [
+                        {
+                          "strings_as_keyword": {
+                            "match_mapping_type": "string",
+                            "mapping": {
+                              "type": "keyword",
+                              "ignore_above": 1024
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }'
+
+              echo "OpenSearch init completed successfully."
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dpn-opensearch-alerting-init
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-alerting-init
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: dpn-opensearch-alerting-init
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: opensearch-alerting-init
+          image: curlimages/curl:8.8.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for OpenSearch before alerting init..."
+
+              until curl -fsS http://dpn-opensearch-health:9200/_cluster/health; do
+                echo "OpenSearch not ready yet..."
+                sleep 10
+              done
+
+              echo "Creating alerting placeholder index..."
+
+              curl -fsS -X PUT "http://dpn-opensearch-health:9200/dpn-alerting-init" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "settings": {
+                    "index": {
+                      "number_of_replicas": 0
+                    }
+                  }
+                }' || true
+
+              echo "OpenSearch alerting init completed."
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dpn-opensearch-dashboard-health
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-dashboard-health
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dpn-opensearch-dashboard-health
+  template:
+    metadata:
+      labels:
+        app: dpn-opensearch-dashboard-health
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: opensearch-dashboards
+          image: opensearchproject/opensearch-dashboards:2.11.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: OPENSEARCH_HOSTS
+              value: '["http://dpn-opensearch-health:9200"]'
+            - name: DISABLE_SECURITY_DASHBOARDS_PLUGIN
+              value: "true"
+            - name: OPENSEARCH_DASHBOARDS_DATEFORMAT_TZ
+              value: "UTC"
+          ports:
+            - name: http
+              containerPort: 5601
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5601
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5601
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dpn-opensearch-dashboard-health
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-dashboard-health
+spec:
+  type: ClusterIP
+  selector:
+    app: dpn-opensearch-dashboard-health
+  ports:
+    - name: http
+      port: 5601
+      targetPort: 5601
+      protocol: TCP

@@ -1,0 +1,488 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "dpn-pipeline-metrics",
+    "project": "dpn-monitoring"
+  },
+  "spec": {
+    "display": {
+      "name": "DPN Pipeline Monitoring",
+      "description": "OTel Collector throughput, errors, efficiency, and Prometheus self-health"
+    },
+    "duration": "1h",
+    "refreshInterval": "30s",
+    "datasources": {},
+    "variables": [],
+    "panels": {
+      "collector_uptime": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Collector Uptime" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "otelcol_process_uptime{job=\"otel-collector\"}"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "seconds" },
+              "sparkline": {}
+            }
+          }
+        }
+      },
+      "collector_cpu": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Collector CPU Rate" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_process_cpu_seconds{job=\"otel-collector\"}[5m])"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "decimal", "decimalPlaces": 3 },
+              "sparkline": {}
+            }
+          }
+        }
+      },
+      "collector_heap": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Collector Heap Memory" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "otelcol_process_runtime_heap_alloc_bytes{job=\"otel-collector\"}"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "bytes" },
+              "sparkline": {}
+            }
+          }
+        }
+      },
+      "metrics_received_rate": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Metric Points Received / sec" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_receiver_accepted_metric_points{job=\"otel-collector\"}[1m])",
+                    "seriesNameFormat": "received ({{receiver}})"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "decimal" } }
+            }
+          }
+        }
+      },
+      "metrics_sent_rate": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Metric Points Sent / sec — by Exporter" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_exporter_sent_metric_points{job=\"otel-collector\"}[1m])",
+                    "seriesNameFormat": "{{exporter}}"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "decimal" } }
+            }
+          }
+        }
+      },
+      "logs_sent_rate": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Log Records Sent / sec — by Exporter" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_exporter_sent_log_records{job=\"otel-collector\"}[1m])",
+                    "seriesNameFormat": "{{exporter}}"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "decimal" } }
+            }
+          }
+        }
+      },
+      "failed_metric_exports": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Failed Metric Exports / sec" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_exporter_send_failed_metric_points{job=\"otel-collector\"}[1m])",
+                    "seriesNameFormat": "{{exporter}}"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "decimal" } }
+            }
+          }
+        }
+      },
+      "refused_metrics": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Refused Metric Points / sec" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_receiver_refused_metric_points{job=\"otel-collector\"}[1m])",
+                    "seriesNameFormat": "refused"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "decimal" } }
+            }
+          }
+        }
+      },
+      "queue_utilisation": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Exporter Queue Utilisation %" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "100 * otelcol_exporter_queue_size{job=\"otel-collector\"} / otelcol_exporter_queue_capacity{job=\"otel-collector\"}",
+                    "seriesNameFormat": "{{exporter}}"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "percent" } }
+            }
+          }
+        }
+      },
+      "batch_size_avg": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Average Batch Size (records/batch)" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "rate(otelcol_processor_batch_batch_send_size_sum{job=\"otel-collector\"}[5m]) / rate(otelcol_processor_batch_batch_send_size_count{job=\"otel-collector\"}[5m])",
+                    "seriesNameFormat": "avg batch"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "decimal" } }
+            }
+          }
+        }
+      },
+      "grpc_p99": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "gRPC Receiver p99 Latency" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "histogram_quantile(0.99, rate(otelcol_rpc_server_duration_bucket{job=\"otel-collector\"}[5m])) / 1e6",
+                    "seriesNameFormat": "p99 ({{rpc_service}})"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "yAxis": { "format": { "unit": "milliseconds" } }
+            }
+          }
+        }
+      },
+      "targets_up": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Scrape Targets Up" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "count(up == 1)"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "decimal" },
+              "sparkline": {}
+            }
+          }
+        }
+      },
+      "remote_write_samples": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "Remote Write Samples Received (total)" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "prometheus_remote_storage_samples_in_total"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "decimal" },
+              "sparkline": {}
+            }
+          }
+        }
+      },
+      "tsdb_series": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "TSDB Active Series" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "prometheus_tsdb_head_series"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "decimal" },
+              "sparkline": {}
+            }
+          }
+        }
+      },
+      "tsdb_wal": {
+        "kind": "Panel",
+        "spec": {
+          "display": { "name": "TSDB WAL Storage" },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "datasource": { "kind": "PrometheusDatasource" },
+                    "query": "prometheus_tsdb_wal_storage_size_bytes"
+                  }
+                }
+              }
+            }
+          ],
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last",
+              "format": { "unit": "bytes" },
+              "sparkline": {}
+            }
+          }
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Collector Health At-a-Glance", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 8,  "height": 4, "content": { "$ref": "#/spec/panels/collector_uptime" } },
+            { "x": 8,  "y": 0, "width": 8,  "height": 4, "content": { "$ref": "#/spec/panels/collector_cpu" } },
+            { "x": 16, "y": 0, "width": 8,  "height": 4, "content": { "$ref": "#/spec/panels/collector_heap" } }
+          ]
+        }
+      },
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Signal Throughput", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 12, "height": 7, "content": { "$ref": "#/spec/panels/metrics_received_rate" } },
+            { "x": 12, "y": 0, "width": 12, "height": 7, "content": { "$ref": "#/spec/panels/metrics_sent_rate" } },
+            { "x": 0,  "y": 7, "width": 24, "height": 7, "content": { "$ref": "#/spec/panels/logs_sent_rate" } }
+          ]
+        }
+      },
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Error and Drop Detection", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 12, "height": 7, "content": { "$ref": "#/spec/panels/failed_metric_exports" } },
+            { "x": 12, "y": 0, "width": 12, "height": 7, "content": { "$ref": "#/spec/panels/refused_metrics" } }
+          ]
+        }
+      },
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Pipeline Efficiency", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 8,  "height": 7, "content": { "$ref": "#/spec/panels/queue_utilisation" } },
+            { "x": 8,  "y": 0, "width": 8,  "height": 7, "content": { "$ref": "#/spec/panels/batch_size_avg" } },
+            { "x": 16, "y": 0, "width": 8,  "height": 7, "content": { "$ref": "#/spec/panels/grpc_p99" } }
+          ]
+        }
+      },
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": { "title": "Prometheus Self-Health", "collapse": { "open": true } },
+          "items": [
+            { "x": 0,  "y": 0, "width": 6,  "height": 4, "content": { "$ref": "#/spec/panels/targets_up" } },
+            { "x": 6,  "y": 0, "width": 6,  "height": 4, "content": { "$ref": "#/spec/panels/remote_write_samples" } },
+            { "x": 12, "y": 0, "width": 6,  "height": 4, "content": { "$ref": "#/spec/panels/tsdb_series" } },
+            { "x": 18, "y": 0, "width": 6,  "height": 4, "content": { "$ref": "#/spec/panels/tsdb_wal" } }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+kind: GlobalDatasource
+metadata:
+  name: prometheus
+spec:
+  plugin:
+    kind: PrometheusDatasource
+    spec:
+      proxy:
+        kind: HTTPProxy
+        spec:
+          url: http://dpn-prometheus-health:9090

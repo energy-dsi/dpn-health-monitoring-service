@@ -1,0 +1,55 @@
+{{- if .Values.collector.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.collector.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.collector.service.type }}
+  selector:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: grpc
+      port: {{ .Values.collector.service.grpcPort }}
+      targetPort: 14250
+    - name: http
+      port: {{ .Values.collector.service.httpPort }}
+      targetPort: 14268
+    - name: otlp-grpc
+      port: {{ .Values.collector.service.otlpGrpcPort }}
+      targetPort: 4317
+    - name: otlp-http
+      port: {{ .Values.collector.service.otlpHttpPort }}
+      targetPort: 4318
+    - name: zipkin
+      port: {{ .Values.collector.service.zipkinPort }}
+      targetPort: 9411
+{{- end }}
+---
+{{- if .Values.query.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.query.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: query
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: {{ .Values.query.service.type }}
+  selector:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: query
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: query
+      port: {{ .Values.query.service.port }}
+      targetPort: 16686
+{{- end }}

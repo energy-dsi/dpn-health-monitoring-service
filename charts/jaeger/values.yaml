@@ -1,0 +1,94 @@
+namespace: ns-dpn-health-01
+
+image:
+  tag: "1.57.0"
+  pullPolicy: IfNotPresent
+
+storage:
+  type: elasticsearch
+  elasticsearch:
+    serverUrls: "http://dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200"
+    username: ""
+    password: ""
+    indexPrefix: "jaeger"
+
+kafka:
+  brokers: "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092"
+  topic: "otel-traces"
+  consumerGroup: "jaeger-ingester"
+  encoding: protobuf
+
+collector:
+  enabled: false
+  name: dpn-jaeger-collector-health
+  replicaCount: 0
+  image:
+    repository: jaegertracing/jaeger-collector
+  service:
+    type: ClusterIP
+    grpcPort: 14250
+    httpPort: 14268
+    otlpGrpcPort: 4317
+    otlpHttpPort: 4318
+    zipkinPort: 9411
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+query:
+  enabled: true
+  name: dpn-jaeger-query-health
+  replicaCount: 2
+  image:
+    repository: jaegertracing/jaeger-query
+  service:
+    type: ClusterIP
+    port: 16686
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+ingester:
+  enabled: true
+  name: dpn-jaeger-ingester-health
+  replicaCount: 2
+  image:
+    repository: jaegertracing/jaeger-ingester
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+loadBalancer:
+  enabled: false
+  name: dpn-jaeger-query-health-ui
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1

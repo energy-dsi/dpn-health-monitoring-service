@@ -1,0 +1,20 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "otel-collector.fullname" . }}
+  namespace: {{ .Values.namespace | default "ns-dpn-health-01" }}
+  labels:
+    {{- include "otel-collector.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "otel-collector.selectorLabels" . | nindent 6 }}
+{{- end }}
+
+# Made with Bob

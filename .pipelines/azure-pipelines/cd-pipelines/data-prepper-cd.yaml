@@ -1,0 +1,228 @@
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+jobs:
+- deployment: DeployDataPrepper
+  displayName: Deploy Data Prepper
+  ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    environment: dsi-ppd
+  ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    environment: dsi-devtest
+  ${{ else }}:
+    environment: dsi-dev
+
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
+
+        - task: AzureCLI@2
+          displayName: Deploy Data Prepper
+          inputs:
+            azureSubscription: ${{ parameters.ServiceConnection }}
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              set -euo pipefail
+
+              if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+                echo "ERROR: Environment '${{ parameters.environment }}' is configured for a single-DPN deployment and does not support cluster '${{ parameters.cluster }}'."
+                exit 1
+              fi
+
+              CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+              CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+
+              RELEASE_NAME="dpn-data-prepper"
+              CHART_DIR="$(Build.SourcesDirectory)/charts/data-prepper"
+              VALUES_FILE="$CHART_DIR/values.yaml"
+
+              echo "CONFIG_FILE=$CONFIG_FILE"
+              echo "CHART_DIR=$CHART_DIR"
+              echo "VALUES_FILE=$VALUES_FILE"
+
+              if [ ! -f "$CONFIG_FILE" ]; then
+                if [ -f "$CONFIG_FILE_CLUSTER" ]; then
+                  CONFIG_FILE="$CONFIG_FILE_CLUSTER"
+                else
+                  echo "Config file missing: $CONFIG_FILE"
+                  exit 1
+                fi
+              fi
+
+              if [ ! -d "$CHART_DIR" ]; then
+                echo "Data Prepper chart directory missing: $CHART_DIR"
+                exit 1
+              fi
+
+              if [ ! -f "$CHART_DIR/Chart.yaml" ]; then
+                echo "Data Prepper Chart.yaml missing: $CHART_DIR/Chart.yaml"
+                exit 1
+              fi
+
+              if [ ! -d "$CHART_DIR/templates" ]; then
+                echo "Data Prepper templates directory missing: $CHART_DIR/templates"
+                exit 1
+              fi
+
+              if [ ! -f "$VALUES_FILE" ]; then
+                echo "Data Prepper values file missing: $VALUES_FILE"
+                exit 1
+              fi
+
+              export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+              echo "RESOURCE_GROUP=$RESOURCE_GROUP"
+              echo "AKS_CLUSTER=$AKS_CLUSTER"
+              echo "NAMESPACE=$NAMESPACE"
+
+              az aks install-cli --kubelogin-version v0.2.19
+
+              az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+              az aks get-credentials \
+                --resource-group "$RESOURCE_GROUP" \
+                --name "$AKS_CLUSTER" \
+                --overwrite-existing
+
+              kubelogin convert-kubeconfig -l azurecli
+
+              echo "Checking namespace..."
+              kubectl get namespace "$NAMESPACE"
+
+              echo "========================================"
+              echo "Checking Data Prepper dependencies..."
+              echo "========================================"
+
+              echo "Checking Kafka service..."
+              kubectl get svc dpn-kafka-health -n "$NAMESPACE"
+
+              echo "Checking Kafka endpoints..."
+              if ! kubectl get endpoints dpn-kafka-health -n "$NAMESPACE" | grep -q ":9092"; then
+                echo "Kafka endpoint dpn-kafka-health does not have ready backend on port 9092"
+                kubectl get endpoints dpn-kafka-health -n "$NAMESPACE" || true
+                exit 1
+              fi
+
+              echo "Checking OpenSearch service..."
+              kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+
+              echo "Checking OpenSearch endpoints..."
+              if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" | grep -q ":9200"; then
+                echo "OpenSearch endpoint dpn-opensearch-health does not have ready backend on port 9200"
+                kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" || true
+                exit 1
+              fi
+
+              echo "========================================"
+              echo "Linting Data Prepper chart..."
+              echo "========================================"
+              helm lint "$CHART_DIR" -f "$VALUES_FILE"
+
+              echo "========================================"
+              echo "Rendering Data Prepper chart..."
+              echo "========================================"
+              helm template "$RELEASE_NAME" "$CHART_DIR" \
+                --namespace "$NAMESPACE" \
+                -f "$VALUES_FILE" \
+                --debug > /tmp/data-prepper-rendered.yaml
+
+              echo "Rendered resource kinds:"
+              grep "^kind:" /tmp/data-prepper-rendered.yaml || true
+
+              echo "Checking rendered names..."
+              grep -n "name: dpn-data-prepper-health" /tmp/data-prepper-rendered.yaml || true
+
+              echo "Checking Kafka broker reference..."
+              grep -n "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092" /tmp/data-prepper-rendered.yaml || true
+
+              echo "Checking OpenSearch reference..."
+              grep -n "dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200" /tmp/data-prepper-rendered.yaml || true
+
+              echo "========================================"
+              echo "Deploying Data Prepper..."
+              echo "========================================"
+
+              helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+                --namespace "$NAMESPACE" \
+                -f "$VALUES_FILE" \
+                --wait \
+                --timeout 10m \
+                --debug
+
+              echo "========================================"
+              echo "Rolling out Data Prepper..."
+              echo "========================================"
+
+              kubectl rollout status deployment/dpn-data-prepper-health \
+                -n "$NAMESPACE" \
+                --timeout=300s
+
+              echo "========================================"
+              echo "Data Prepper resources:"
+              echo "========================================"
+
+              kubectl get pods -n "$NAMESPACE" | grep data-prepper || true
+              kubectl get svc -n "$NAMESPACE" | grep data-prepper || true
+              kubectl get endpoints -n "$NAMESPACE" | grep data-prepper || true
+              kubectl get deploy -n "$NAMESPACE" | grep data-prepper || true
+
+              echo "========================================"
+              echo "Data Prepper logs:"
+              echo "========================================"
+
+              kubectl logs -n "$NAMESPACE" \
+                -l app=dpn-data-prepper-health \
+                --tail=150 || true
+
+              echo "========================================"
+              echo "Testing Data Prepper service connectivity..."
+              echo "========================================"
+
+              kubectl run data-prepper-curl-test \
+                -n "$NAMESPACE" \
+                --image=curlimages/curl:8.8.0 \
+                --restart=Never \
+                --rm \
+                --attach \
+                --command -- sh -c "curl -i --max-time 10 http://dpn-data-prepper-health:4900 || true"
+
+              echo "Data Prepper deployment completed."

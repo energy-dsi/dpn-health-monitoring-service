@@ -1,0 +1,163 @@
+kafka:
+  enabled: false
+
+namespace: ns-dpn-health-01
+
+mode: deployment
+replicaCount: 1
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+  tag: 0.95.0
+  pullPolicy: IfNotPresent
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+  processors:
+    batch:
+      timeout: 10s
+      send_batch_size: 1024
+
+    resource:
+      attributes:
+        - key: cluster
+          value: <<your specific value>>
+          action: upsert
+
+    probabilistic_sampler:
+      sampling_percentage: 10
+
+#    redaction:
+#      allow_all_keys: false
+#      blocked_values:
+#        - "(?i)(api[_-]?key|apikey)\\s*[:=]"
+#      summary: debug
+
+  exporters:
+    kafka/metrics:
+      brokers:
+        - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092 
+      topic: otel-metrics
+      encoding: otlp_json
+      protocol_version: 2.0.0
+
+    kafka/logs:
+      brokers:
+        - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092   
+      topic: otel-logs
+      encoding: otlp_json
+      protocol_version: 2.0.0
+
+    kafka/traces:
+      brokers:
+        - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092  
+      topic: otel-traces
+      encoding: otlp_json
+      protocol_version: 2.0.0
+
+  extensions:
+    # Serves the health endpoint on :13133 (path /healthz) that the
+    # liveness/readiness probes hit. Without this nothing listens on 13133
+    # -> probes fail -> CrashLoop.
+    health_check:
+      endpoint: 0.0.0.0:13133
+      path: /healthz
+
+  service:
+    extensions: [health_check]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [batch, resource, probabilistic_sampler]
+        exporters: [kafka/traces]
+
+      metrics:
+        receivers: [otlp]
+        processors: [batch, resource]
+        exporters: [kafka/metrics]
+
+      logs:
+        receivers: [otlp]
+#        processors: [batch, resource, redaction]
+        processors: [batch, resource]
+        exporters: [kafka/logs]
+
+service:
+  # Service is named "dpn-otel-collector" so applications that send OTLP to that
+  # historical hostname (dpn-otel-collector.ns-dpn-health-01.svc.cluster.local)
+  # resolve. Deployment/ServiceAccount keep the -health fullname.
+  name: dpn-otel-collector
+  type: ClusterIP
+  ports:
+    otlp-grpc:
+      port: 4317
+    otlp-http:
+      port: 4318
+    metrics:
+      port: 8888
+    health:
+      port: 13133
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+serviceAccount:
+  create: true
+
+livenessProbe:
+  httpGet:
+    path: /healthz   
+    port: 13133
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz   
+    port: 13133
+  initialDelaySeconds: 10
+  periodSeconds: 5
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8888"
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - otel-collector
+          topologyKey: kubernetes.io/hostname
