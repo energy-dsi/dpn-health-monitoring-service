@@ -1,0 +1,497 @@
+name: DPN Health Monitoring
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Choose DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "aws"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+      imageTag:
+        description: "OTel Collector image tag"
+        required: true
+        default: "0.95.0"
+        type: string
+
+      otelImageRepository:
+        description: "OTel Collector image path AFTER <<your specific value>>/ (e.g. 1.0.1/opentelemetry-collector-contrib) — leave blank to use the environment's configured repository"
+        required: false
+        default: ""
+        type: string
+
+      portalImageTag:
+        description: "dpn-portal image tag — the short git-SHA dpn-portal-ci.yaml's BuildAndPush stage printed"
+        required: true
+        type: string
+
+      portalImageRepository:
+        description: "dpn-portal image path AFTER <<your specific value>>/"
+        required: false
+        default: "1.0.1/dpn-portal"
+        type: string
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ============================================================
+  # Init — read the JSON config for this environment/cluster once
+  # and hand RESOURCE_GROUP/AKS_CLUSTER/NAMESPACE to every child
+  # pipeline as inputs, so they don't each re-parse the file.
+  # Authorization itself comes from the GitHub Environment
+  # (dev-dpn01 / dev-dpn02 / devtest-dpn01 / devtest-dpn02) each
+  # child job binds to.
+  # ============================================================
+  init:
+    name: Resolve Deployment Config
+    runs-on: [self-hosted, vmss]
+    outputs:
+      ACR_NAME: ${{ steps.config.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ steps.config.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ steps.config.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ steps.config.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ steps.config.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ steps.config.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ns-dpn-health-01
+      ARM_SUBSCRIPTION_ID: ${{ steps.config.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ steps.config.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ steps.config.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ steps.config.outputs.EKS_CLUSTER }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Applied Parameters
+        shell: bash
+        run: |
+          echo "environment=${{ inputs.environment }}"
+          echo "cluster=${{ inputs.cluster }}"
+          echo "cloud=${{ inputs.cloud }}"
+          echo "imageTag=${{ inputs.imageTag }}"
+          echo "otelImageRepository=${{ inputs.otelImageRepository }}"
+          echo "portalImageTag=${{ inputs.portalImageTag }}"
+          echo "portalImageRepository=${{ inputs.portalImageRepository }}"
+
+      - name: Read Deployment Config
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+            echo "Set ${key}"
+          done
+
+  # ============================================================
+  # 2. Kafka
+  # ============================================================
+  kafka:
+    name: Kafka
+    needs: init
+    uses: ./.github/workflows/dpn-cd-kafka.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 3. OpenSearch
+  # ============================================================
+  opensearch:
+    name: OpenSearch
+    needs: [init, kafka]
+    uses: ./.github/workflows/dpn-cd-opensearch.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 4. Prometheus
+  # ============================================================
+  prometheus:
+    name: Prometheus
+    needs: [init, opensearch]
+    uses: ./.github/workflows/dpn-cd-prometheus.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 5. Thanos — depends on Prometheus
+  # ============================================================
+  thanos:
+    name: Thanos
+    needs: [init, prometheus]
+    uses: ./.github/workflows/dpn-cd-thanos.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 6. Data Prepper — depends on Kafka + OpenSearch
+  # ============================================================
+  data-prepper:
+    name: Data Prepper
+    needs:
+      - init
+      - kafka
+      - opensearch
+    uses: ./.github/workflows/dpn-cd-data-prepper.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 7. Jaeger — depends on Kafka + OpenSearch
+  # ============================================================
+  jaeger:
+    name: Jaeger
+    needs:
+      - init
+      - kafka
+      - opensearch
+    uses: ./.github/workflows/dpn-cd-jaeger.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 8. Perses — depends on Prometheus + Thanos
+  # ============================================================
+  perses:
+    name: Perses
+    needs:
+      - init
+      - prometheus
+      - thanos
+    uses: ./.github/workflows/dpn-cd-perses.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit
+
+  # ============================================================
+  # 9. OTel Collector — depends on Kafka + OpenSearch + Data Prepper + Jaeger
+  # ============================================================
+  otel:
+    name: OTel
+    needs:
+      - init
+      - kafka
+      - opensearch
+      - data-prepper
+      - jaeger
+    uses: ./.github/workflows/dpn-cd-otel.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+      imageTag: ${{ inputs.imageTag }}
+      imageRepository: ${{ inputs.otelImageRepository }}
+    secrets: inherit
+
+  # ============================================================
+  # 10. Portal — the tile landing page. No backend dependency in this
+  # repo (it only calls out to Keycloak, provisioned elsewhere), so it
+  # only needs init.
+  # ============================================================
+  dpn-portal:
+    name: Portal
+    needs: init
+    uses: ./.github/workflows/dpn-cd-portal.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+      imageTag: ${{ inputs.portalImageTag }}
+      imageRepository: ${{ inputs.portalImageRepository }}
+    secrets: inherit
+
+  # ============================================================
+  # 11. OAuth2 Proxy (Keycloak gateway) — one release per remaining
+  # observability UI: opensearch, jaeger, perses, portal. Chained
+  # sequentially, each after its own backend job and after the previous
+  # oauth2-proxy job: Azure reconciles the shared LoadBalancer address
+  # unreliably when several Services mutate it at once (see
+  # dpn-health-monitoring/charts/oauth2-proxy/README.md). kafka-ui, kafka-
+  # ui-2, prometheus, thanos and airflow all used to have a gateway here too
+  # — all five have been retired (each now either handles its own login or
+  # is published directly with no login), matching source.
+  # ============================================================
+  oauth2-proxy-opensearch:
+    name: OAuth2 Proxy - OpenSearch
+    needs: [init, opensearch]
+    uses: ./.github/workflows/dpn-cd-oauth2-proxy.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+      component: opensearch
+    secrets: inherit
+
+  oauth2-proxy-jaeger:
+    name: OAuth2 Proxy - Jaeger
+    needs: [init, jaeger, oauth2-proxy-opensearch]
+    uses: ./.github/workflows/dpn-cd-oauth2-proxy.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+      component: jaeger
+    secrets: inherit
+
+  # Prometheus and Thanos deliberately have no oauth2-proxy gateway here --
+  # neither UI is meant for direct browser access, both are consumed through
+  # Perses instead (see charts/oauth2-proxy/README.md). Their own component
+  # jobs above still deploy the services themselves, now published directly
+  # on the shared internal LB (see charts/prometheus and charts/thanos
+  # values/<cloud>/test-dpn01.yaml) -- only their oauth2-proxy gateways are
+  # gone.
+
+  oauth2-proxy-perses:
+    name: OAuth2 Proxy - Perses
+    needs: [init, perses, oauth2-proxy-jaeger]
+    uses: ./.github/workflows/dpn-cd-oauth2-proxy.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+      component: perses
+    secrets: inherit
+
+  # kafka-ui-2 and airflow also have no oauth2-proxy gateway here any more --
+  # see charts/oauth2-proxy/README.md. Both front UIs from OTHER domains
+  # (dpn-federator-gateway, dpn-data-pipelines) that this workflow does not
+  # deploy, and their gateways were removed with no replacement added here.
+
+  oauth2-proxy-portal:
+    name: OAuth2 Proxy - Portal
+    needs: [init, dpn-portal, oauth2-proxy-perses]
+    uses: ./.github/workflows/dpn-cd-oauth2-proxy.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+      component: portal
+    secrets: inherit
+
+  # ============================================================
+  # 12. Validate — depends on final deployable components
+  # ============================================================
+  validate:
+    name: Validate
+    needs:
+      - init
+      - otel
+      - perses
+      - thanos
+      - data-prepper
+      - jaeger
+      - oauth2-proxy-portal
+    uses: ./.github/workflows/dpn-cd-validate.yml
+    with:
+      environment: ${{ inputs.environment }}
+      cluster: ${{ inputs.cluster }}
+      cloud: ${{ inputs.cloud }}
+      ACR_NAME: ${{ needs.init.outputs.ACR_NAME }}
+      BASE_REGISTRY: ${{ needs.init.outputs.BASE_REGISTRY }}
+      AZURE_SUBSCRIPTION_ID: ${{ needs.init.outputs.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ needs.init.outputs.RESOURCE_GROUP }}
+      AKS_CLUSTER: ${{ needs.init.outputs.AKS_CLUSTER }}
+      KEY_VAULT_NAME: ${{ needs.init.outputs.KEY_VAULT_NAME }}
+      NAMESPACE: ${{ needs.init.outputs.NAMESPACE }}
+      ARM_SUBSCRIPTION_ID: ${{ needs.init.outputs.ARM_SUBSCRIPTION_ID }}
+      AWS_REGION: ${{ needs.init.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ needs.init.outputs.AWS_ACCOUNT_ID }}
+      EKS_CLUSTER: ${{ needs.init.outputs.EKS_CLUSTER }}
+    secrets: inherit

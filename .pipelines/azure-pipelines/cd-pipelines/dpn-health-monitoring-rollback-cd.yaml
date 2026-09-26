@@ -1,0 +1,335 @@
+# ============================================================================
+# DPN Health Monitoring — Rollback (selective, per-component revision)
+# ============================================================================
+# Tick the components you want to roll back and set the target revision for
+# each. Only CHECKED components are rolled back; unchecked ones are left
+# untouched (their revision field is ignored).
+#
+#   <component> revision = 0  -> that release's PREVIOUS revision (Helm default)
+#   <component> revision = N  -> that release's specific revision N
+#                                (see `helm history <release>`)
+#
+# NOTE (ADO): the checkbox and its revision field are separate parameters on the
+# same Run dialog — ADO cannot prompt in a later stage or hide the revision
+# fields for unchecked components. Just fill the revision only for the ones you
+# tick; leave the rest at 0 (ignored).
+#
+# Helm revision numbers are per-release, so revision N means a different point
+# for each component — set each one from that release's own `helm history`.
+# Rollback restores Helm-managed resources only.
+# ============================================================================
+
+trigger: none
+
+pool:
+  name: '<<YOUR AGENT POOL>>'
+
+parameters:
+# ---- Components to roll back (tick) + target revision for each -------------
+# Listed in `helm list` order (alphabetical by release name) for easy cross-reference.
+- name: dataPrepper
+  displayName: 'Roll back Data Prepper (dpn-data-prepper)'
+  type: boolean
+  default: false
+- name: dataPrepperRevision
+  displayName: '   ↳ Data Prepper target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: jaeger
+  displayName: 'Roll back Jaeger (dpn-jaeger)'
+  type: boolean
+  default: false
+- name: jaegerRevision
+  displayName: '   ↳ Jaeger target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: kafka
+  displayName: 'Roll back Kafka (dpn-kafka-stack)'
+  type: boolean
+  default: false
+- name: kafkaRevision
+  displayName: '   ↳ Kafka target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: portal
+  displayName: 'Roll back dpn-portal (dpn-portal)'
+  type: boolean
+  default: false
+- name: portalRevision
+  displayName: '   ↳ dpn-portal target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: oauth2ProxyRedis
+  displayName: 'Roll back oauth2-proxy session store (dpn-redis-ui-health)'
+  type: boolean
+  default: false
+- name: oauth2ProxyRedisRevision
+  displayName: '   ↳ oauth2-proxy session store target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: oauth2ProxyOsd
+  displayName: 'Roll back oauth2-proxy OpenSearch gateway (dpn-oauth2-proxy-osd)'
+  type: boolean
+  default: false
+- name: oauth2ProxyOsdRevision
+  displayName: '   ↳ oauth2-proxy OpenSearch gateway target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: oauth2ProxyJaeger
+  displayName: 'Roll back oauth2-proxy Jaeger gateway (dpn-oauth2-proxy-jaeger)'
+  type: boolean
+  default: false
+- name: oauth2ProxyJaegerRevision
+  displayName: '   ↳ oauth2-proxy Jaeger gateway target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: oauth2ProxyPerses
+  displayName: 'Roll back oauth2-proxy Perses gateway (dpn-oauth2-proxy-perses)'
+  type: boolean
+  default: false
+- name: oauth2ProxyPersesRevision
+  displayName: '   ↳ oauth2-proxy Perses gateway target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: oauth2ProxyPortal
+  displayName: 'Roll back oauth2-proxy dpn-portal gateway (dpn-oauth2-proxy-portal)'
+  type: boolean
+  default: false
+- name: oauth2ProxyPortalRevision
+  displayName: '   ↳ oauth2-proxy dpn-portal gateway target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: opensearch
+  displayName: 'Roll back OpenSearch (dpn-opensearch)'
+  type: boolean
+  default: false
+- name: opensearchRevision
+  displayName: '   ↳ OpenSearch target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: otel
+  displayName: 'Roll back OTel Collector (dpn-otel-collector-health)'
+  type: boolean
+  default: false
+- name: otelRevision
+  displayName: '   ↳ OTel target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: perses
+  displayName: 'Roll back Perses (dpn-perses)'
+  type: boolean
+  default: false
+- name: persesRevision
+  displayName: '   ↳ Perses target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: prometheus
+  displayName: 'Roll back Prometheus (dpn-prometheus)'
+  type: boolean
+  default: false
+- name: prometheusRevision
+  displayName: '   ↳ Prometheus target revision (0 = previous)'
+  type: string
+  default: '0'
+
+- name: thanos
+  displayName: 'Roll back Thanos (dpn-thanos)'
+  type: boolean
+  default: false
+- name: thanosRevision
+  displayName: '   ↳ Thanos target revision (0 = previous)'
+  type: string
+  default: '0'
+
+# ---- Target ----------------------------------------------------------------
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+# NOTE: approval_group is NOT used — the approval gate is derived from the
+# `environment` parameter (see the if/elseif/else on the deployment job below).
+# Left commented for reference.
+# - name: approval_group
+#   displayName: 'Approval Group'
+#   type: string
+#   default: dsi-dev
+#   values:
+#     - dsi-dev
+#     - dsi-devtest
+#     - dsi-ppd
+
+stages:
+- stage: Rollback
+  displayName: Rollback
+  jobs:
+  - deployment: Rollback
+    displayName: Roll back selected components
+    ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+      environment: dsi-ppd
+    ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+      environment: dsi-devtest
+    ${{ else }}:
+      environment: dsi-dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Roll back selected Helm releases
+            inputs:
+              azureSubscription: ${{ parameters.ServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -uo pipefail
+
+                if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+                  echo "ERROR: '${{ parameters.environment }}' does not support cluster '${{ parameters.cluster }}'."
+                  exit 1
+                fi
+
+                # Checkbox parameters -> "true"/"false"; revision parameters -> number (0 = previous)
+                DO_KAFKA="${{ lower(parameters.kafka) }}";               REV_KAFKA="${{ parameters.kafkaRevision }}"
+                DO_OPENSEARCH="${{ lower(parameters.opensearch) }}";     REV_OPENSEARCH="${{ parameters.opensearchRevision }}"
+                DO_PROMETHEUS="${{ lower(parameters.prometheus) }}";     REV_PROMETHEUS="${{ parameters.prometheusRevision }}"
+                DO_THANOS="${{ lower(parameters.thanos) }}";             REV_THANOS="${{ parameters.thanosRevision }}"
+                DO_DATAPREPPER="${{ lower(parameters.dataPrepper) }}";   REV_DATAPREPPER="${{ parameters.dataPrepperRevision }}"
+                DO_JAEGER="${{ lower(parameters.jaeger) }}";             REV_JAEGER="${{ parameters.jaegerRevision }}"
+                DO_PERSES="${{ lower(parameters.perses) }}";             REV_PERSES="${{ parameters.persesRevision }}"
+                DO_OTEL="${{ lower(parameters.otel) }}";                 REV_OTEL="${{ parameters.otelRevision }}"
+                DO_PORTAL="${{ lower(parameters.portal) }}";             REV_PORTAL="${{ parameters.portalRevision }}"
+                DO_OAUTH2_REDIS="${{ lower(parameters.oauth2ProxyRedis) }}";       REV_OAUTH2_REDIS="${{ parameters.oauth2ProxyRedisRevision }}"
+                DO_OAUTH2_OSD="${{ lower(parameters.oauth2ProxyOsd) }}";           REV_OAUTH2_OSD="${{ parameters.oauth2ProxyOsdRevision }}"
+                DO_OAUTH2_JAEGER="${{ lower(parameters.oauth2ProxyJaeger) }}";    REV_OAUTH2_JAEGER="${{ parameters.oauth2ProxyJaegerRevision }}"
+                DO_OAUTH2_PERSES="${{ lower(parameters.oauth2ProxyPerses) }}";    REV_OAUTH2_PERSES="${{ parameters.oauth2ProxyPersesRevision }}"
+                DO_OAUTH2_PORTAL="${{ lower(parameters.oauth2ProxyPortal) }}";    REV_OAUTH2_PORTAL="${{ parameters.oauth2ProxyPortalRevision }}"
+
+                CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+                CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+                if [ ! -f "$CONFIG_FILE" ]; then CONFIG_FILE="$CONFIG_FILE_CLUSTER"; fi
+                [ -f "$CONFIG_FILE" ] || { echo "Config file missing: $CONFIG_FILE"; exit 1; }
+
+                export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+                echo "NAMESPACE=$NAMESPACE  AKS_CLUSTER=$AKS_CLUSTER"
+
+                # Install CLIs only if missing (avoids GitHub download rate limits on re-runs)
+                if ! command -v kubectl &>/dev/null || ! command -v kubelogin &>/dev/null; then
+                  echo "kubectl or kubelogin not found, installing..."
+                  az aks install-cli --client-version 1.32.0 --kubelogin-version 0.1.4
+                else
+                  echo "kubectl and kubelogin already installed, skipping"
+                fi
+
+                az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+                az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" --overwrite-existing
+                kubelogin convert-kubeconfig -l azurecli
+                kubectl get namespace "$NAMESPACE"
+
+                # name | release | selected-flag | target-revision  (master-CD order)
+                COMPONENTS=(
+                  "kafka|dpn-kafka-stack|$DO_KAFKA|$REV_KAFKA"
+                  "opensearch|dpn-opensearch|$DO_OPENSEARCH|$REV_OPENSEARCH"
+                  "prometheus|dpn-prometheus|$DO_PROMETHEUS|$REV_PROMETHEUS"
+                  "thanos|dpn-thanos|$DO_THANOS|$REV_THANOS"
+                  "data-prepper|dpn-data-prepper|$DO_DATAPREPPER|$REV_DATAPREPPER"
+                  "jaeger|dpn-jaeger|$DO_JAEGER|$REV_JAEGER"
+                  "perses|dpn-perses|$DO_PERSES|$REV_PERSES"
+                  "otel|dpn-otel-collector-health|$DO_OTEL|$REV_OTEL"
+                  "portal|dpn-portal|$DO_PORTAL|$REV_PORTAL"
+                  "oauth2-proxy-redis|dpn-redis-ui-health|$DO_OAUTH2_REDIS|$REV_OAUTH2_REDIS"
+                  "oauth2-proxy-osd|dpn-oauth2-proxy-osd|$DO_OAUTH2_OSD|$REV_OAUTH2_OSD"
+                  "oauth2-proxy-jaeger|dpn-oauth2-proxy-jaeger|$DO_OAUTH2_JAEGER|$REV_OAUTH2_JAEGER"
+                  "oauth2-proxy-perses|dpn-oauth2-proxy-perses|$DO_OAUTH2_PERSES|$REV_OAUTH2_PERSES"
+                  "oauth2-proxy-portal|dpn-oauth2-proxy-portal|$DO_OAUTH2_PORTAL|$REV_OAUTH2_PORTAL"
+                )
+
+                DONE=(); SKIPPED=(); FAILED=(); ANY=false
+
+                for c in "${COMPONENTS[@]}"; do
+                  IFS='|' read -r NAME RELEASE FLAG REV <<< "$c"
+                  if [ "$FLAG" != "true" ]; then
+                    continue
+                  fi
+                  ANY=true
+                  REV="${REV:-0}"
+                  echo ""
+                  echo "======================================================================"
+                  if [ "$REV" = "0" ]; then
+                    echo "helm rollback  ->  $NAME  ($RELEASE)  to previous revision"
+                  else
+                    echo "helm rollback  ->  $NAME  ($RELEASE)  to revision $REV"
+                  fi
+                  echo "======================================================================"
+
+                  if ! helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+                    echo "Release $RELEASE not installed in $NAMESPACE — skipping."
+                    SKIPPED+=("$NAME")
+                    continue
+                  fi
+
+                  # revision 0 = previous (Helm treats 0 as "previous release")
+                  if helm rollback "$RELEASE" "$REV" -n "$NAMESPACE" --wait --timeout 15m; then
+                    DONE+=("$NAME(rev:$REV)")
+                    helm status "$RELEASE" -n "$NAMESPACE" | sed -n '1,4p' || true
+                  else
+                    echo "ERROR: rollback of $RELEASE to revision $REV failed."
+                    echo "  (check available revisions with 'helm history $RELEASE -n $NAMESPACE')"
+                    FAILED+=("$NAME")
+                  fi
+                done
+
+                echo ""
+                echo "======================================================================"
+                echo "Rollback summary"
+                echo "======================================================================"
+                if [ "$ANY" != "true" ]; then
+                  echo "No components were selected — nothing to do."
+                  echo "Tick at least one component and re-run."
+                  exit 0
+                fi
+                echo "Rolled back (${#DONE[@]}): ${DONE[*]:-none}"
+                echo "Skipped not-installed (${#SKIPPED[@]}): ${SKIPPED[*]:-none}"
+                if [ "${#FAILED[@]}" -gt 0 ]; then
+                  echo "Failed (${#FAILED[@]}): ${FAILED[*]}"
+                  exit 1
+                fi
+                echo "Rollback completed."

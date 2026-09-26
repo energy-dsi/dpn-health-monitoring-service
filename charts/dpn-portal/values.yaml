@@ -1,0 +1,183 @@
+# ===========================================================================
+# dpn-portal — the tile landing page fronted by oauth2-proxy on port 8443
+# (charts/oauth2-proxy/values-portal.yaml). Mirrors app/dpn-portal as run by
+# config/docker-compose.observability-full.yml's dpn-portal service, with two
+# things corrected for the cluster rather than copied from compose:
+#
+#   1. Tile URLs use the cert-covered DNS name over https, not "localhost" —
+#      see the DNS section of charts/oauth2-proxy/README.md for why an IP or
+#      an arbitrary hostname fails TLS verification here.
+#   2. The Airflow tile points at :8084, the port nginx published it on in
+#      this cluster — compose uses :8085, a different number for the same UI.
+# ===========================================================================
+
+namespace: ns-dpn-health-01
+name: dpn-portal
+
+# No default here on purpose. app/dpn-portal is built from source in this
+# repo's ../app/dpn-portal (see docker-compose), and this chart cannot guess
+# which container registry / tag the team publishes it to. helm fails to
+# render rather than pulling a wrong or nonexistent image.
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# Scales on whichever of CPU/memory utilization crosses its target first,
+# checked against the requests below (HPA computes utilization as a % of the
+# pod's own resources.requests, not resources.limits) — so a pod is only
+# considered busy relative to what it actually asked for.
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# The browser-facing Keycloak address, realm, and this portal's OWN
+# browser-facing URL — used ONLY to build the logout link on the tile page.
+# app/dpn-portal's /oauth2/sign_out link needs to chain through Keycloak's
+# real end-session endpoint, since oauth2-proxy itself cannot do that with
+# skip_oidc_discovery=true (see main.py's _logout_url and
+# charts/oauth2-proxy/README.md). This chart has no other relationship to
+# charts/oauth2-proxy, so these three values are a deliberate second copy —
+# keep them in sync with keycloak.publicUrl / keycloak.realm and externalUrl
+# in charts/oauth2-proxy/values.yaml / values-portal.yaml, which describe the
+# same Keycloak and the same proxy release from that chart's side.
+keycloak:
+  publicUrl: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+  realm: dpn-realm
+
+# Must equal externalUrl in charts/oauth2-proxy/values-portal.yaml exactly —
+# it is registered with Keycloak as this client's post_logout_redirect_uri,
+# which Keycloak matches the same way it matches an OAuth redirect_uri: no
+# trailing slash, no path, scheme and port both significant.
+externalUrl: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8443"
+
+# ---------------------------------------------------------------------------
+# Every OTHER oauth2-proxy release's externalUrl (see
+# charts/oauth2-proxy/values-*.yaml) — every entry EXCEPT this portal's own.
+#
+# Logging out clears this proxy's own cookie and ends the Keycloak SSO
+# session, but the other eight releases each keep their own separate cookie
+# (_oauth2_proxy_jaeger, _oauth2_proxy_kafka_ui, ...) precisely so their
+# sessions don't collide with one another — so none of them notice the SSO
+# session ending until their own cookie_refresh (30m) next checks Keycloak.
+# All nine releases share one Keycloak client (dpn-service-client), and
+# Keycloak's front-channel logout can only iframe ONE registered URL per
+# client, so it cannot fan this out on its own either.
+#
+# index.html fires a /oauth2/sign_out beacon at each of these before
+# following the real Keycloak logout link, so one click here signs the user
+# out of every UI. Keep this list in sync with charts/oauth2-proxy/values-
+# *.yaml's externalUrl values whenever a release is added or removed — see
+# "Adding another UI" in charts/oauth2-proxy/README.md.
+otherUiUrls:
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601"   # opensearch
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8082"   # kafka-ui
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8086"   # kafka-ui-2
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:16686"  # jaeger
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:9081"   # prometheus
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:9091"   # thanos
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8083"   # perses
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8084"   # airflow
+
+# What app/dpn-portal renders as tiles, read from the TILES_CONFIG env var —
+# same shape as the TILES_CONFIG in docker-compose.observability-full.yml
+# (name/subtitle/description/icon/variant/groups/components per tile, each
+# component a {name, url} pair) — only the component urls differ, using the
+# cluster DNS names/ports from this file instead of compose's localhost ones.
+# "groups" gates a tile's visibility by Keycloak realm role, same set as
+# keycloak.allowedRoles in charts/oauth2-proxy/values.yaml; a tile with no
+# "groups" key is visible to everyone who reached the portal at all. GRPC
+# Gateway Client / Certification Vault Service have no matching service in
+# this cluster either, so their components carry no url.
+
+
+# Each component below carries "url" (the browser-facing link) and, where it
+# differs, "probe_url" (the real in-cluster Service address). portal/health.py
+# probes probe_url (falling back to url when unset) and links out to url —
+# without this split, a component whose url is a *.svc.cluster.local name
+# published only in external/corporate DNS (see charts/oauth2-proxy/
+# README.md's DNS section) always reports Unavailable, since CoreDNS returns
+# NXDOMAIN for a *.svc.cluster.local name with no matching Service rather
+# than forwarding it upstream to the DNS zone browsers use. Any HTTP
+# response — including an oauth2-proxy login redirect — counts as reachable.
+tiles:
+  - name: Users & Roles
+    subtitle: ""
+    description: Manage DPN users, groups, and role assignments in Keycloak.
+    icon: users
+    variant: alt
+    groups: ["dpnadmin"]
+    components:
+      - name: Keycloak Console
+        url: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+  - name: Data
+    subtitle: Store
+    description: Logical storage location for Data Products that are ready for sharing
+    icon: kafka
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: DPN Kafka
+        url: "https://dpn-kafka-ui-external.ns-dpn-01.svc.cluster.local:8086"
+  - name: Gateway
+    subtitle: ""
+    description: Manage the secure and controlled exposure of Data Products to authorised Consumers
+    icon: gateway
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: GRPC Gateway Client
+        url: "http://dpn-federator-client-1-external.ns-dpn-01.svc.cluster.local:8085"
+  - name: Data
+    subtitle: Pipeline
+    description: Manage your pipelines.
+    icon: airflow
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: Pipeline Orchestrator
+        url: "https://dpn-airflow-webserver-external.ns-dpn-01.svc.cluster.local:8080"
+  - name: Security
+    subtitle: Services
+    description: Provides the foundational security capabilities required to support authentication, authorisation, and policy enforcement within the DPN.
+    icon: security
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: Certification Vault Service
+        url: "https://dpn-vault-https-lb.ns-dpn-01.svc.cluster.local:8200"
+  - name: Health
+    subtitle: Monitoring Service
+    description: Supports the visibility and auditability of a Participant's compliance with DSI operational and behavioural requirement
+    icon: health
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      # Each of these fronts an oauth2-proxy release - dpn-oauth2-proxy-osd
+      # / -jaeger / -perses are the releases' real Service names (see
+      # charts/oauth2-proxy/templates/service.yaml + values-*.yaml's name:).
+      - name: Log Stack
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601"
+        probe_url: "https://dpn-oauth2-proxy-osd.ns-dpn-health-01.svc.cluster.local:5601"
+      - name: Traces Stack
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:16686"
+        probe_url: "https://dpn-oauth2-proxy-jaeger.ns-dpn-health-01.svc.cluster.local:16686"
+      - name: Metrics Dashboard
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8083"
+        probe_url: "https://dpn-oauth2-proxy-perses.ns-dpn-health-01.svc.cluster.local:8083"
+      - name: Collector Stack
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8082"
+        probe_url: "https://dpn-kafka-health-ui.ns-dpn-health-01.svc.cluster.local:8082"
+
+resources:
+  requests:
+    cpu: 25m
+    # 64Mi, not 32Mi: live usage sits around 33Mi at idle (mostly Flask/
+    # gunicorn's own footprint), so a 32Mi request already reads as >100%
+    # utilization with zero real traffic — the memory-based HPA target below
+    # would misfire on every deploy. 64Mi leaves idle at ~50%, so 80% only
+    # gets crossed under genuine added load.
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi

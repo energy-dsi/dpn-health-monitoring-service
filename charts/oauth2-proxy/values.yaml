@@ -1,0 +1,213 @@
+# ===========================================================================
+# oauth2-proxy — Keycloak OIDC gateway for the DPN health observability UIs.
+#
+# These are the DEFAULTS shared by every UI this proxy fronts. One Helm
+# release is deployed per UI, each with its own values file:
+#
+#   charts/oauth2-proxy/values-opensearch.yaml   -> OpenSearch Dashboards
+#   (jaeger / perses / kafka-ui to follow the same pattern)
+#
+# The tricky bit this chart exists to solve: Keycloak runs in ns-dpn-01 while
+# every health-monitoring pod runs in ns-dpn-health-01. Kubernetes Services
+# resolve cross-namespace only via their fully-qualified name, and Secrets do
+# not cross namespaces at all — so the Keycloak CA and the client secret must
+# be copied into ns-dpn-health-01 (see README.md).
+# ===========================================================================
+
+namespace: ns-dpn-health-01
+
+# Overridden per UI in the values-<component>.yaml file.
+name: dpn-oauth2-proxy
+
+image:
+  repository: quay.io/oauth2-proxy/oauth2-proxy
+  tag: "v7.6.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# ---------------------------------------------------------------------------
+# The UI this proxy guards. Must be the in-cluster URL of a ClusterIP Service
+# in THIS namespace — the UI itself is never exposed to the browser directly.
+# Trailing slash matters to oauth2-proxy: without it the upstream is treated
+# as a static response rather than a proxy target.
+# ---------------------------------------------------------------------------
+upstream:
+  url: ""
+
+# ---------------------------------------------------------------------------
+# Browser-facing URL of THIS proxy (scheme + host + port, no trailing slash).
+#
+# There is a chicken-and-egg here: with service.type LoadBalancer, Azure only
+# assigns the IP once the Service exists. Either pin service.loadBalancerIP to
+# a free address in the subnet, or deploy once, read the assigned IP, then set
+# this and redeploy. The CD pipeline warns when the two disagree.
+#
+# Whatever value goes here must ALSO be registered in Keycloak as a valid
+# redirect URI on the client:  <externalUrl>/oauth2/callback
+# ---------------------------------------------------------------------------
+externalUrl: ""
+
+keycloak:
+  # Browser-facing Keycloak base URL — only login_url is built from it, since
+  # that is the one redirect a browser has to follow. Keycloak publishes a
+  # LoadBalancer of its own (dpn-keycloak-service-lb in ns-dpn-01), so this is
+  # that address, not the ClusterIP Service name.
+  #
+  # Set here rather than per UI: every proxy logs in against the same Keycloak,
+  # so repeating it in eight values files would only create eight chances for
+  # it to drift.
+  publicUrl: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+
+  # In-cluster URL for the server-to-server calls (token redeem, JWKS).
+  # Fully qualified because Keycloak is in a different namespace.
+  internalUrl: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+
+  # What oauth2-proxy compares the token's `iss` claim against. Empty means
+  # "same as internalUrl", which is correct while Keycloak runs without
+  # KC_HOSTNAME: it derives `iss` from the Host header of whoever calls it, and
+  # the caller that mints the token is this pod over the in-cluster name.
+  #
+  # Set this to publicUrl if KC_HOSTNAME is ever pinned on the ns-dpn-01
+  # Keycloak. The CD pipeline reads the realm's advertised issuer and fails
+  # with that instruction if the two stop agreeing, so this cannot rot
+  # silently.
+  issuerUrl: ""
+
+  realm: dpn-realm
+
+  # Confidential client from config/keycloak/dpn-realm.json. Its secret is
+  # supplied through the Secret below, never through values.
+  clientId: dpn-service-client
+
+  # Keycloak has no "groups" client scope in this realm — realm roles ride in
+  # a custom "roles" claim via a protocol mapper, so the scope list must be
+  # pinned or Keycloak rejects the login with invalid_scope.
+  scope: "openid email profile"
+
+  # Only these realm roles may pass the gate.
+  allowedRoles:
+    - dpnadmin
+    - dpnreader
+    - dpnoperationadmin
+    - dpnoperationreadonly
+    - dpndeveloperadmin
+    - dpndeveloperreadonly
+
+  # Last resort. The Keycloak certificate is issued for its PUBLIC hostname,
+  # so calling it as dpn-keycloak.ns-dpn-01.svc.cluster.local can fail
+  # hostname verification even with the CA trusted. Prefer adding that SAN to
+  # the Keycloak cert; flip this to true only if that is not possible.
+  insecureSkipVerify: false
+
+# ---------------------------------------------------------------------------
+# TLS terminated by oauth2-proxy itself — there is no ingress controller in
+# this cluster, so the proxy is the only place browser-facing HTTPS can live.
+#
+# An EXISTING kubernetes.io/tls Secret, not created by this chart. It supplies
+# three files: tls.crt + tls.key serve the browser, and ca.crt is the DPN CA
+# used to verify Keycloak — which is why no separate CA Secret is needed.
+# ---------------------------------------------------------------------------
+tlsSecretName: dpn-health-tls
+
+# ---------------------------------------------------------------------------
+# cookieName is the Secret this chart DOES own, holding the generated
+# cookie-secret. Empty means "<name of the release>-cookie". Nothing to
+# supply, ever. See templates/secret.yaml.
+# ---------------------------------------------------------------------------
+secret:
+  cookieName: ""
+
+# ---------------------------------------------------------------------------
+# The Keycloak client credential for dpn-service-client, synced from Azure
+# Key Vault by templates/secretproviderclass.yaml via the Secrets Store CSI
+# driver — the same provider-azure add-on and VM-managed-identity auth
+# already running on this cluster for dpn-keycloak-kv-secrets and
+# federator-client-kv-secrets in ns-dpn-01
+# (kubectl get secretproviderclass -n ns-dpn-01 -o yaml).
+#
+# This replaces the previous hand-made dpn-oauth2-proxy-keycloak Secret
+# entirely: the CSI driver mirrors objectName's value into a Secret named by
+# oauth2-proxy.akvSecretName, and the Deployment reads that Secret's
+# `client-secret` key — nothing left to create by hand.
+#
+# tenantId and userAssignedIdentityID default to this cluster's identity
+# (<<your specific value>> / <<your specific value>>); override per environment if a
+# different cluster/vault pair uses a different tenant or identity.
+# ---------------------------------------------------------------------------
+akv:
+  keyvaultName: <<your specific value>>
+  tenantId: <<your specific value>>
+  userAssignedIdentityID: <<your specific value>>
+  # AKV object name of the dpn-service-client secret (hyphens, matching this
+  # cluster's existing AKV object naming convention).
+  objectName: KC-SERVICE-CLIENT-SECRET
+
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  # Browser-facing port. Kept identical to the port nginx used for the same UI
+  # so existing bookmarks keep working.
+  port: 5601
+  # Optional static internal IP. Pin this to break the externalUrl
+  # chicken-and-egg described above.
+  loadBalancerIP: <<your specific value>>
+
+cookie:
+  name: _oauth2_proxy
+  # A 4h working session, deliberately chosen over oauth2-proxy's 168h default
+  # and over the "0" (browser-session cookie) alternative.
+  #
+  # Any non-zero value makes this a PERSISTENT cookie, written to disk with an
+  # Expires stamp, so it SURVIVES A BROWSER CLOSE — reopening within the window
+  # resolves the cookie against the Redis session and lets the user in. That is
+  # accepted here rather than accidental, and what bounds it is the refresh
+  # below meeting Keycloak's 30m SSO idle timeout (-SessionIdleSeconds in
+  # scripts/keycloak-provision.ps1): once the session is older than
+  # cookie.refresh, the next request forces a token refresh against Keycloak,
+  # and any gap longer than the SSO idle timeout means that refresh token is
+  # already dead and the user re-authenticates for real. So the window in which
+  # a reopened browser stays logged in is roughly cookie.refresh, not the full
+  # 4h — but it is NOT zero. Set this to "0" if a browser close must always end
+  # the session; the cost is that Redis session keys then carry no TTL, since
+  # oauth2-proxy derives that TTL from this value.
+  expire: "4h"
+  # Re-validates against Keycloak on this interval, which is also how long a
+  # session on ANOTHER proxy release survives after a logout elsewhere: the
+  # refresh token is rejected once the SSO session is gone and that proxy
+  # drops its session. oauth2-proxy cannot receive Keycloak's back-channel
+  # logout, so this interval is the only lever on that lag.
+  refresh: "30m"
+  samesite: lax
+
+# ---------------------------------------------------------------------------
+# Where the session lives once login succeeds.
+#
+# type: cookie (oauth2-proxy's default) stores the full Keycloak token bundle
+# — id_token + access_token + refresh_token — in the browser cookie itself.
+# This realm's tokens carry an audience claim and a multivalued roles claim
+# (see the Keycloak mappers in README.md), and a cookie built from that can
+# exceed the header-size limits browsers and intermediate proxies enforce,
+# surfacing as HTTP 431 "Request Header Too Large" — exactly the failure the
+# docker-compose stack's own redis service exists to avoid.
+#
+# type: redis moves the token bundle server-side, into the shared
+# charts/oauth2-proxy-redis release (dpn-redis-ui-health), and shrinks the
+# browser cookie to a session ID. That Redis is a SEPARATE release from any
+# of these nine oauth2-proxy releases on purpose — see that chart's values.yaml
+# for why coupling it to one release's lifecycle was already tried and undone
+# once this project.
+# ---------------------------------------------------------------------------
+sessionStore:
+  type: redis
+  redis:
+    connectionUrl: "redis://dpn-redis-ui-health.ns-dpn-health-01.svc.cluster.local:6379"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

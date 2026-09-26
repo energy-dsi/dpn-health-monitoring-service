@@ -1,0 +1,207 @@
+# ==============================================================================
+# Deploys charts/dpn-portal with an already-built image.
+#
+# dpn-portal (app/dpn-portal) is the one component in this repo built from
+# source rather than pulled from an existing registry — every other CD
+# pipeline here deploys a pre-built image (Keycloak, OpenSearch, oauth2-proxy,
+# ...). charts/dpn-portal/values.yaml leaves image.repository/tag blank and
+# fails to render on purpose rather than guessing a registry path, so this
+# pipeline exists specifically to hand a real value to helm.
+#
+# Building, scanning, signing and pushing the image is no longer this
+# pipeline's job — that now lives in
+# .pipelines/azure-pipelines/ci-pipelines/dpn-portal-ci.yaml (Checkmarx, FOSSA,
+# unit tests, SonarQube, then build/push/cosign-sign/JFrog X-Ray). This
+# pipeline just takes the `imageTag` that CI run produced and deploys it,
+# gated by the same environment-based approval (dsi-dev / dsi-devtest /
+# dsi-ppd) as before — same split as dpn-file-scan-service-ci.yaml /
+# dpn-file-scan-service-cd.yml in the dpn-file-scan-service repo.
+#
+# After deploying, this also re-queries the running pod's actual image
+# digest (kubectl get pods ... containerStatuses[0].imageID) and publishes
+# it as build artifact deployed-image-digest — confirms the pod really did
+# pull the requested tag, rather than just trusting `helm upgrade` succeeded.
+# CI's own digest (published as artifact full-image-digest) is captured
+# earlier, at push time, and can differ if something else changed what the
+# registry serves for that tag in between.
+#
+# Consumed TWO ways: as a job template from monitoring-master-cd.yaml's
+# DpnPortalImage stage (the full-environment path, which also runs the
+# OAuth2Proxy stage's "portal" job afterward), AND as its own standalone
+# dpn-portal-cd ADO pipeline, for redeploying just dpn-portal without
+# re-running/re-approving the other six component stages.
+#
+# dpn-portal always needs its oauth2-proxy gateway
+# (charts/oauth2-proxy/values-portal.yaml) in front of it before anyone can
+# reach it — see charts/oauth2-proxy/README.md and app/dpn-portal/main.py,
+# which has no auth/TLS of its own. Deploying via the standalone
+# dpn-portal-cd pipeline does NOT touch that gateway — it only re-points the
+# existing dpn-portal Deployment at a new image, it does not (re)provision
+# the gateway in front of it. That is the accepted trade-off for this
+# pipeline existing: use it to push a new dpn-portal build quickly once the
+# gateway is already up; run the full master pipeline instead the first time
+# an environment is stood up, or if the gateway itself needs touching.
+#
+# A pipeline-level `trigger:`/`pool:` here would be invalid for a file also
+# consumed as a job template, so the pool is set on the `deployment:` job
+# below instead — required for the standalone pipeline (a Microsoft-hosted
+# agent cannot resolve the AKS cluster's private-link DNS name at all), and
+# harmless when templated in since it matches monitoring-master-cd.yaml's
+# own top-level pool.
+# ==============================================================================
+
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+# Required — the short git-SHA tag that dpn-portal-ci.yaml's BuildAndPush
+# stage printed at the end of its run ("Print imageTag for CD" step). No
+# default on purpose: deploying without an explicit, known-good tag would
+# silently redeploy whatever image.tag the last release happened to leave in
+# the cluster's Helm history.
+- name: imageTag
+  type: string
+
+jobs:
+- job: DeployDpnPortal
+  displayName: Deploy dpn-portal
+  pool:
+    name: <<YOUR AGENT POOL>>
+  steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Deploy dpn-portal chart with the given image tag
+    inputs:
+      azureSubscription: ${{ parameters.ServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+
+        IMAGE_TAG="${{ parameters.imageTag }}"
+        if [ -z "$IMAGE_TAG" ]; then
+          echo "##vso[task.logissue type=error]imageTag parameter is required — read it off the dpn-portal-ci.yaml run you want to deploy."
+          exit 1
+        fi
+
+        CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+        CONFIG_FILE_ENV="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+
+        if [ ! -f "$CONFIG_FILE" ]; then
+          if [ -f "$CONFIG_FILE_ENV" ]; then
+            CONFIG_FILE="$CONFIG_FILE_ENV"
+          else
+            echo "Config file missing: $CONFIG_FILE"
+            exit 1
+          fi
+        fi
+
+        export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+        IMAGE_REPOSITORY="$CONTAINER_REGISTRY_URL/dpn-portal"
+
+        # Per-cluster overrides (charts/dpn-portal/values-dpn01.yaml /
+        # values-dpn02.yaml) — falls back to the chart's own values.yaml
+        # if a cluster-specific file hasn't been added yet.
+        VALUES_FILE="$(Build.SourcesDirectory)/charts/dpn-portal/values-${{ parameters.cluster }}.yaml"
+        if [ ! -f "$VALUES_FILE" ]; then
+          VALUES_FILE="$(Build.SourcesDirectory)/charts/dpn-portal/values.yaml"
+        fi
+        echo "VALUES_FILE=$VALUES_FILE"
+
+        az aks install-cli --kubelogin-version v0.2.19
+        az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+        az aks get-credentials \
+          --resource-group "$RESOURCE_GROUP" \
+          --name "$AKS_CLUSTER" \
+          --overwrite-existing
+        kubelogin convert-kubeconfig -l azurecli
+
+        echo "========================================"
+        echo "Deploying dpn-portal"
+        echo "========================================"
+        echo "image.repository=$IMAGE_REPOSITORY"
+        echo "image.tag=$IMAGE_TAG"
+
+        helm upgrade --install dpn-portal "$(Build.SourcesDirectory)/charts/dpn-portal" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          --set image.repository="$IMAGE_REPOSITORY" \
+          --set image.tag="$IMAGE_TAG" \
+          --wait \
+          --timeout 5m
+
+        kubectl rollout status deployment/dpn-portal -n "$NAMESPACE" --timeout=300s
+
+        echo "================================================="
+        echo "CAPTURE DEPLOYED IMAGE DIGEST"
+        echo "================================================="
+
+        IMAGE_DIGEST=$(kubectl get pods -n "$NAMESPACE" \
+          -l app=dpn-portal \
+          -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')
+
+        if [ -z "$IMAGE_DIGEST" ]; then
+          echo "##[error]Could not resolve deployed image digest from pod status"
+          exit 1
+        fi
+
+        echo "Deployed image digest: $IMAGE_DIGEST"
+
+        mkdir -p "$(Build.ArtifactStagingDirectory)/deployed-digest"
+
+        {
+          echo "$IMAGE_DIGEST"
+          echo "component=dpn-portal"
+          echo "environment=${{ parameters.environment }}"
+          echo "dpncluster=${{ parameters.cluster }}"
+          echo "imageTag=$IMAGE_TAG"
+        } > "$(Build.ArtifactStagingDirectory)/deployed-digest/dpn-portal-digest.txt"
+
+        echo "Digest written to artifact staging directory"
+
+        echo "dpn-portal deployed. Run the 'portal' component of"
+        echo "oauth2-proxy-cd.yaml next to put the Keycloak gateway in front of it."
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Deployed Image Digest'
+    inputs:
+      pathtoPublish: '$(Build.ArtifactStagingDirectory)/deployed-digest'
+      ArtifactName: 'deployed-image-digest'

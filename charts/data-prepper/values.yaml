@@ -1,0 +1,71 @@
+namespace: ns-dpn-health-01
+
+name: dpn-data-prepper-health
+replicaCount: 1
+
+
+image:
+  repository: opensearchproject/data-prepper
+  tag: "2.6.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 4900
+
+kafka:
+  brokers:
+    - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+
+opensearch:
+  # Security plugin enabled: switched from http to https, and the datawriter
+  # service account (all_access via roles_mapping.yml) is now required.
+  # Password comes in as the DATAWRITER_PASSWORD env var (deployment.yaml,
+  # sourced from the dpn-opensearch-health-oidc-secrets Secret), referenced
+  # in the pipeline config below via Data Prepper's ${env:VAR} substitution.
+  hosts:
+    - https://dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200
+  username: datawriter
+
+# Data Prepper's core admin API (:4900 - /list, /metrics/prometheus, /metrics/sys)
+# over TLS, reusing the SAME universal cert as everything else on this cluster
+# rather than minting a new one. The cert lives in `dpn-tls` as a Java keystore
+# (keystore.jks) already - but Data Prepper's core server only accepts PKCS12
+# (see templates/deployment.yaml's init container), so it's converted at pod
+# startup, not baked into the chart.
+tls:
+  enabled: true
+  secretName: dpn-tls
+  keystoreFile: keystore.jks
+  # Password comes in as the KEYSTORE_PASSWORD env var (deployment.yaml),
+  # read straight from tls-auth-secret (created once in this namespace by
+  # dpn-tls-cd) rather than this chart pulling its own copy of the same
+  # platform-wide KEYSTORE-PASSWORD/TRUSTSTORE-PASSWORD value from Key Vault
+  # - no akv block needed here.
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1536Mi
+  limits:
+    cpu: 1000m
+    # Raised from 1Gi - the JVM's default container-aware heap sizing (~25%
+    # of this limit, since no explicit -Xmx is set anywhere in this chart)
+    # was too small to drain a large backlog on the otel-logs Kafka topic,
+    # causing a sustained OutOfMemoryError crash loop.
+    memory: 4Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop:
+      - ALL

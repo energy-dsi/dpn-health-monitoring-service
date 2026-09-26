@@ -1,0 +1,624 @@
+# ==============================================================================
+# CI pipeline for app/dpn-portal ONLY.
+# ==============================================================================
+
+trigger: none
+
+pool:
+  name: <<YOUR AGENT POOL>>
+
+#--------------------------
+# Parameters
+#--------------------------
+parameters:
+- name: serviceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+# NOTE: dpncluster applies to dev/devtest only (dpn01 + dpn02)
+# pdev/ptest/puat run on dpn01 only; selecting dpn02 for them fails fast below.
+- name: dpncluster
+  displayName: Target DPN Cluster (dpn02 = dev/devtest only)
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+- name: environment
+  type: string
+  default: dev
+  displayName: Environment Name
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+#--------------------------
+# Variables
+#--------------------------
+variables:
+- group: soner_report
+- group: fossa_scan
+- group: jfrog
+
+- name: APP_DIR
+  value: app/dpn-portal
+
+- ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+  - name: PARAMETERS_FILE
+    value: .pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpncluster }}.json
+- ${{ else }}:
+  - name: PARAMETERS_FILE
+    value: .pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.dpncluster }}.json
+
+- name: CLOC_EXCLUDES
+  value: ".git,.venv,__pycache__,.pytest_cache"
+  
+- name: PROJECT_NAME
+  value: $(Build.Repository.Name)
+  
+- name: PUBLISHED_DOCKER_IMAGE
+  value: "$(BASE_REGISTRY)/$(PROJECT_NAME):$(IMAGE_TAG)"
+
+- name: IMAGE_TAG
+  value: $(Build.BuildId)
+
+#--------------------------
+# Stages
+#--------------------------
+
+# =====================================================
+# Stage 1 — Checkmarx, scoped to app/dpn-portal
+# =====================================================
+stages:
+- stage: Checkmarx_Scan
+  jobs:
+  - job: cxOneScan
+    steps:
+    - template: ../CxOneScan.yml
+      parameters:
+        scanType: ''
+        cxoneserviceName: 'checkmarxOne-sc'
+        cxoneProjectName: 'dpn-portal'
+        cxoneProjectGroup: 'AZ-APP-CheckmarxOne-NESO'
+        cxoneTenantName: 'neso'
+        appName: 'dpn-portal'
+        excludeFolders: ''
+        filterPattern: 'app/dpn-portal/**'
+    # Dedicated IaC-security pass over app/dpn-portal/Dockerfile — the
+    # combined "Full Scan" above does not guarantee IaC coverage on its own
+    # (only the sast/iac/sca-typed variants in CxOneScan.yml pass
+    # --scan-types explicitly). This is the "Dockerfile is secure" check.
+    - template: ../CxOneScan.yml
+      parameters:
+        scanType: 'iac'
+        cxoneserviceName: 'checkmarxOne-sc'
+        cxoneProjectName: 'dpn-portal'
+        cxoneProjectGroup: 'AZ-APP-CheckmarxOne-NESO'
+        cxoneTenantName: 'neso'
+        appName: 'dpn-portal-dockerfile'
+        excludeFolders: ''
+        filterPattern: 'app/dpn-portal/Dockerfile'
+
+# =====================================================
+# Stage 2 — FOSSA Open Source Scan
+# =====================================================
+- stage: Fossa_Scan
+  displayName: 'FOSSA Open Source Scan'
+  condition: succeededOrFailed()
+  jobs:
+  - job: fossaScan
+    steps:
+    - checkout: self
+    - template: ../FossaScan.yml
+      parameters:
+        fossaProjectName: 'dpn-portal'
+        failOnIssues: false
+
+# --------------------------------------
+# Stage 3 — Unit Tests and Code Coverage
+# --------------------------------------
+# Runs app/dpn-portal/tests/test_main.py. The "no tests directory" branch
+# below is kept as a safety net (publishes an empty coverage/JUnit report
+# instead of failing the whole stage) in case the tests directory is ever
+# removed or excluded from a checkout.
+- stage: UnitTests
+  displayName: 'Unit Tests & Code Coverage'
+  jobs:
+  - job: RunPythonTests
+    displayName: 'Run pytest with coverage.py'
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.11'
+
+    - script: |
+        set -e
+        python -m pip install --upgrade pip
+        pip install -r "$(APP_DIR)/requirements-dev.txt"
+      displayName: 'Install dependencies'
+
+    - script: |
+        set -e
+        export PYTHONPATH=$(Build.SourcesDirectory)/$(APP_DIR)
+
+        mkdir -p "$(Build.SourcesDirectory)/test-results"
+        mkdir -p "$(Build.SourcesDirectory)/coverage"
+
+        if [ -d "$(Build.SourcesDirectory)/$(APP_DIR)/tests" ]; then
+          pytest "$(APP_DIR)/tests" \
+            --junitxml="$(Build.SourcesDirectory)/test-results/junit.xml" \
+            --cov="$(APP_DIR)" \
+            --cov-report=xml:"$(Build.SourcesDirectory)/coverage/coverage.xml" \
+            --cov-report=term-missing
+        else
+          echo "No tests directory at $(APP_DIR)/tests yet — publishing an empty report so Sonar_Scan can still run."
+          printf '<?xml version="1.0" ?>\n<coverage line-rate="0" branch-rate="0"><packages/></coverage>\n' > "$(Build.SourcesDirectory)/coverage/coverage.xml"
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites></testsuites>\n' > "$(Build.SourcesDirectory)/test-results/junit.xml"
+        fi
+      displayName: 'Run tests with pytest and coverage (if present)'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Unit Test Results'
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: 'test-results/junit.xml'
+        failTaskOnFailedTests: true
+
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage'
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: 'coverage/coverage.xml'
+        reportDirectory: 'coverage'
+        failIfCoverageEmpty: false
+
+    # Quality gate: line coverage must be >90%. PublishCodeCoverageResults@2
+    # has no built-in threshold, so read Cobertura's line-rate attribute
+    # directly and fail the build below it.
+    - script: |
+        set -e
+        COVERAGE_FILE="$(Build.SourcesDirectory)/coverage/coverage.xml"
+        LINE_RATE=$(grep -o 'line-rate="[0-9.]*"' "$COVERAGE_FILE" | head -1 | grep -o '[0-9.]*')
+        LINE_RATE=${LINE_RATE:-0}
+        PERCENT=$(awk -v r="$LINE_RATE" 'BEGIN { printf "%.2f", r * 100 }')
+        echo "Line coverage: ${PERCENT}%"
+        if awk -v r="$LINE_RATE" 'BEGIN { exit !(r > 0.90) }'; then
+          echo "Coverage gate passed (> 90%)."
+        else
+          echo "##vso[task.logissue type=error]Coverage gate failed: ${PERCENT}% is not > 90%. Add/extend tests under app/dpn-portal/tests."
+          exit 1
+        fi
+      displayName: 'Enforce >90% code coverage'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Coverage Artifact'
+      inputs:
+        targetPath: 'coverage'
+        artifactName: 'coverage'
+
+    - script: |
+        set -e
+        python -m pip install --upgrade pip
+        pip install cyclonedx-bom
+      displayName: 'Install CycloneDX'
+
+    - script: |
+        set -e
+        mkdir -p sbom-output
+        cyclonedx-py requirements "$(APP_DIR)/requirements.txt" -o "sbom-output/dpn-portal-sbom.json"
+        echo "Generated SBOM files:"
+        ls -l sbom-output
+      displayName: 'Generate SBOM'
+
+    - script: |
+        set -e
+        sudo apt-get update
+        sudo apt-get install -y cloc
+      displayName: 'Install CLOC'
+
+    - script: |
+        set -e
+        echo "Running CLOC analysis on $(APP_DIR)..."
+        cloc "$(APP_DIR)" --exclude-dir=$(CLOC_EXCLUDES) \
+          --json --out=cloc-report.json
+        cloc "$(APP_DIR)" --exclude-dir=$(CLOC_EXCLUDES) \
+          --xml --out=cloc-report.xml
+        cloc "$(APP_DIR)" --exclude-dir=$(CLOC_EXCLUDES)
+      displayName: 'Run CLOC'
+
+    - script: |
+        set -e
+        mkdir -p $(Build.ArtifactStagingDirectory)/cloc-reports
+        cp cloc-report.xml $(Build.ArtifactStagingDirectory)/cloc-reports
+        cp cloc-report.json $(Build.ArtifactStagingDirectory)/cloc-reports
+      displayName: 'Copy CLOC Reports'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish SBOM'
+      inputs:
+        targetPath: 'sbom-output'
+        artifactName: 'SBOM'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish CLOC Report'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/cloc-reports'
+        ArtifactName: 'cloc-reports'
+
+# -------------------------
+# Stage 4 — Sonar Scan
+# -------------------------
+- stage: 'Sonar_Scan'
+  displayName: 'Sonar Scan'
+  pool:
+    name: '<<YOUR AGENT POOL>>'
+
+  jobs:
+  - job: SonarScan
+    displayName: 'Run SonarQube Analysis and Download Report'
+    workspace:
+      clean: all
+    variables:
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+
+    steps:
+    - checkout: self
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Coverage Artifact'
+      inputs:
+        artifact: 'coverage'
+        path: 'coverage'
+
+    - task: DownloadSecureFile@1
+      name: sonarCa
+      displayName: 'Download SonarQube CA certificate'
+      inputs:
+        secureFile: 'sonarcert.pem'
+
+    - script: |
+        set -e
+        sudo cp "$(sonarCa.secureFilePath)" /usr/local/share/ca-certificates/sonarcert.crt
+        sudo update-ca-certificates
+      displayName: 'Install SonarQube CA certificate'
+
+    - script: |
+        set -e
+        python3 --version
+        python3 -m pip install --upgrade pip
+        python3 -m pip install reportlab
+      displayName: 'Use Linux Python and install reportlab'
+
+    - task: SonarQubePrepare@7
+      displayName: 'Prepare SonarQube Analysis'
+      env:
+        NODE_EXTRA_CA_CERTS: $(NODE_EXTRA_CA_CERTS)
+      inputs:
+        SonarQube: 'sonar-neso-sc'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'dpn-portal'
+        cliProjectName: 'dpn-portal'
+        cliSources: '$(APP_DIR)'
+        extraProperties: |
+          sonar.sources=$(APP_DIR)
+          sonar.tests=$(APP_DIR)/tests
+          sonar.python.coverage.reportPaths=coverage/coverage.xml
+          sonar.exclusions=**/__pycache__/**,**/tests/**,**/*.xml,**/*.yaml
+          sonar.coverage.exclusions=**/__init__.py
+
+    - task: SonarQubeAnalyze@7
+      displayName: 'Sonar Scan task'
+      inputs:
+        jdkversion: 'JAVA_HOME'
+
+    - task: SonarQubePublish@7
+      displayName: 'Publish SonarQube Results'
+      env:
+        NODE_EXTRA_CA_CERTS: $(NODE_EXTRA_CA_CERTS)
+      inputs:
+        pollingTimeoutSec: '600'
+
+    - task: Bash@3
+      displayName: "Download SonarQube Reports"
+      env:
+        SQ_URL: "$(sonar_url)"
+        SQ_TOKEN: "$(sonar_token)"
+        SQ_PROJECT: "dpn-portal"
+        SQ_BRANCH: "$(Build.SourceBranchName)"
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          REPORT_DIR="$(Build.SourcesDirectory)/sonarReport"
+          mkdir -p "$REPORT_DIR"
+
+          if [ -z "${SQ_URL}" ] || [[ "${SQ_URL}" == \$\(* ]]; then
+            echo "ERROR: sonar_url is empty or unresolved: ${SQ_URL}"
+            exit 1
+          fi
+
+          if [ -z "${SQ_TOKEN}" ] || [[ "${SQ_TOKEN}" == \$\(* ]]; then
+            echo "ERROR: sonar_token is empty or unresolved"
+            exit 1
+          fi
+
+          echo "Checking SonarQube project exists..."
+          if curl -k -L -f -sS -u "${SQ_TOKEN}:" -G "${SQ_URL}/api/components/show" \
+            --data-urlencode "component=${SQ_PROJECT}" \
+            -o "$REPORT_DIR/component_check.json"; then
+            echo "Project found in SonarQube."
+          else
+            echo "ERROR: SonarQube project key '${SQ_PROJECT}' was not found."
+            echo "Check that cliProjectKey matches the actual SonarQube project key."
+            exit 1
+          fi
+
+          download_with_branch_or_default() {
+            local endpoint="$1"
+            local output="$2"
+            shift 2
+
+            if curl -k -L -f -sS -u "${SQ_TOKEN}:" -G "${SQ_URL}${endpoint}" \
+              --data-urlencode "component=${SQ_PROJECT}" \
+              --data-urlencode "branch=${SQ_BRANCH}" \
+              "$@" \
+              -o "$output"; then
+              echo "Downloaded with branch: $output"
+              return 0
+            fi
+
+            curl -k -L -f -sS -u "${SQ_TOKEN}:" -G "${SQ_URL}${endpoint}" \
+              --data-urlencode "component=${SQ_PROJECT}" \
+              "$@" \
+              -o "$output"
+
+            echo "Downloaded without branch: $output"
+          }
+
+          download_with_branch_or_default \
+            "/api/measures/component" \
+            "$REPORT_DIR/sq_project_snapshot.json" \
+            --data-urlencode "metricKeys=alert_status,quality_gate_details,sqale_rating,reliability_rating,security_rating,sqale_debt_ratio,bugs,new_bugs,vulnerabilities,new_vulnerabilities,code_smells,new_code_smells,violations,new_violations,accepted_issues,coverage,new_coverage,line_coverage,branch_coverage,uncovered_lines,uncovered_conditions,duplicated_lines_density,new_duplicated_lines_density,duplicated_lines,duplicated_blocks,duplicated_files,complexity,cognitive_complexity,ncloc,lines,files,classes,functions,statements,security_hotspots,new_security_hotspots,security_hotspots_reviewed,new_security_hotspots_reviewed"
+
+          download_with_branch_or_default \
+            "/api/measures/search_history" \
+            "$REPORT_DIR/sq_metrics_history.json" \
+            --data-urlencode "metrics=coverage,duplicated_lines_density,bugs,vulnerabilities,code_smells,sqale_rating,reliability_rating,security_rating"
+
+          download_with_branch_or_default \
+            "/api/measures/search_history" \
+            "$REPORT_DIR/sq_security_rating_history.json" \
+            --data-urlencode "metrics=security_rating"
+
+          test -s "$REPORT_DIR/sq_project_snapshot.json"
+          test -s "$REPORT_DIR/sq_metrics_history.json"
+          test -s "$REPORT_DIR/sq_security_rating_history.json"
+
+    - script: |
+        set -e
+
+        REPORT_DIR="$(Build.SourcesDirectory)/sonarReport"
+        SCRIPT_PATH="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/generate_sonar_pdf.py"
+        OUTPUT_FILE="SonarQube_Report-$(Build.SourceBranchName).pdf"
+
+        if [ ! -f "$SCRIPT_PATH" ]; then
+          echo "ERROR: PDF generation script not found at $SCRIPT_PATH"
+          exit 1
+        fi
+
+        python3 "$SCRIPT_PATH" "$REPORT_DIR" "$OUTPUT_FILE"
+
+        test -s "$REPORT_DIR/$OUTPUT_FILE"
+      displayName: 'Generate SonarQube PDF Report'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish SonarQube Report'
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/sonarReport'
+        ArtifactName: 'SonarQube-Report'
+        publishLocation: 'Container'
+
+# -------------------------------------
+# Stage 5 — Build, Push, Sign, Scan
+# -------------------------------------
+- stage: BuildAndPush
+  displayName: Build Docker Images
+  jobs:
+  - job: DockerBuildPush
+    displayName: Build Docker Images
+    steps:
+    - checkout: self
+      # git rev-parse needs history beyond the default shallow fetch to
+      # resolve HEAD reliably in every ADO checkout configuration — same
+      # reason dpn-portal-image-cd.yaml's checkout uses fetchDepth: 0.
+      fetchDepth: 0
+
+    - script: |
+        # Guard: pdev/ptest/puat run on dpn01 only (no dpn02 infrastructure).
+        ENV="${{ parameters.environment }}"
+        CLUSTER="${{ parameters.dpncluster }}"
+        case "$ENV" in
+          pdev|ptest|puat)
+            if [ "$CLUSTER" != "dpn01" ]; then
+              echo "##vso[task.logissue type=error]Environment '$ENV' supports dpn01 only; '$CLUSTER' is not available. Re-run with dpncluster=dpn01."
+              exit 1
+            fi
+            ;;
+        esac
+
+        if [ -f "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)" ]; then
+          echo "Reading parameters from $(PARAMETERS_FILE)"
+          for param in $(jq -r 'keys_unsorted | .[]' "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)"); do
+            value=$(jq -r ".\"$param\"" "$(Build.SourcesDirectory)/$(PARAMETERS_FILE)")
+            echo "##vso[task.setvariable variable=$param]$value"
+            echo "Set parameter $param with $value"
+          done
+        else
+          echo "Error: $(PARAMETERS_FILE) not found!"
+          exit 1
+        fi
+      displayName: "Read Environment Variables"
+
+    - task: AzureCLI@2
+      displayName: Build and Push Docker Image
+      inputs:
+        connectedServiceNameARM: ${{ parameters.serviceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+
+          az acr login --name $(CONTAINER_REGISTRY)
+
+          IMAGE_NAME=dpn-portal
+          # Tag on the commit, not "latest" or the build number — a component
+          # in charts/dpn-portal/values.yaml pinned to a moving tag makes
+          # every future deploy non-reproducible.
+          IMAGE_TAG=$(git -C $(Build.SourcesDirectory) rev-parse --short=12 HEAD)
+          FULL_IMAGE="$(CONTAINER_REGISTRY_URL)/${IMAGE_NAME}:${IMAGE_TAG}"
+
+          docker build -f $(APP_DIR)/Dockerfile -t $FULL_IMAGE $(APP_DIR)
+
+          docker push $FULL_IMAGE
+
+          echo "##vso[task.setvariable variable=FULL_IMAGE]$FULL_IMAGE"
+          echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+
+    #-----------------------------------------
+    # Image Signing with Sigstore/Cosign
+    #-----------------------------------------
+
+    # Capture image digest
+    - script: |
+        FULL_IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $FULL_IMAGE)
+
+        echo $FULL_IMAGE_DIGEST > full-image-digest.txt
+
+        echo "##vso[task.setvariable variable=FULL_IMAGE_DIGEST]$FULL_IMAGE_DIGEST"
+        echo "Full Image Digest: $FULL_IMAGE_DIGEST"
+      displayName: Capture Image Digest
+
+    # Download cosign key
+    - task: DownloadSecureFile@1
+      name: cosignKey
+      inputs:
+        secureFile: cosign.key
+      displayName: 'Download Cosign Key'
+
+    # Install Cosign binary
+    - script: |
+        curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o cosign
+        chmod +x cosign
+        sudo mv cosign /usr/local/bin/
+      displayName: Install Cosign
+
+    # Read secret from AKV
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: '${{ parameters.serviceConnection }}'
+        keyVaultName: '$(KEY_VAULT_NAME)'
+        secretsFilter: 'COSIGN-PASSWORD'
+        RunAsPreJob: false
+
+    # Sign the image with cosign
+    - script: |
+        cat > /tmp/signing-config.json << 'EOF'
+        {
+          "mediaType": "application/vnd.dev.sigstore.signingconfig.v0.2+json",
+          "caUrls": [],
+          "oidcUrls": [],
+          "rekorTlogUrls": [],
+          "tsaUrls": []
+        }
+        EOF
+        cosign sign --key $(cosignKey.secureFilePath) --signing-config /tmp/signing-config.json $(FULL_IMAGE_DIGEST)
+      env:
+        COSIGN_PASSWORD: $(COSIGN-PASSWORD)
+      displayName: Sign Images
+
+    #  Publish the digest file as an artifact
+    - publish: full-image-digest.txt
+      artifact: full-image-digest
+      displayName: Publish Full Image Digest File
+
+    # ---------------------------------------
+    # JFrog X-Ray Set Up
+    # ---------------------------------------
+    - task: DownloadSecureFile@1
+      displayName: Jfrog Certificate Installation
+      name: caCertificate
+      inputs:
+        secureFile: <<your specific value>>.crt
+        retryCount: '1'
+      enabled: true
+
+    - script: |
+        sudo chown root:root $(caCertificate.secureFilePath)
+        sudo chmod a+r $(caCertificate.secureFilePath)
+        sudo ln -s -f -t /etc/ssl/certs/ $(caCertificate.secureFilePath)
+        sudo cp $(caCertificate.secureFilePath) /usr/share/ca-certificates/
+        sudo apt-get -y install zip
+      enabled: true
+      displayName: Install JFrog Certificate
+      
+    - script: mkdir -p $(Pipeline.Workspace)/s/xrayReport
+      displayName: 'Create Xray report output directory'
+
+    - task: JfrogCliV2@1
+      displayName: 'Jfrog Image X-Ray Scan'
+      inputs:
+        jfrogPlatformConnection: 'xray-scan'
+        command: |
+          jf config show
+          jf rt ping
+          jf docker scan $(FULL_IMAGE) --extended-table
+          jf docker scan $(FULL_IMAGE) --extended-table > $(Pipeline.Workspace)/s/xrayReport/xray-report.txt
+          jf docker scan $(FULL_IMAGE) --vuln=true --fail=true --format=json > $(Pipeline.Workspace)/s/xrayReport/xray-report.json
+
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish X-Ray Scan Report"
+      condition: succeededOrFailed()
+      inputs:
+        PathtoPublish: "$(Pipeline.Workspace)/s/xrayReport"
+        ArtifactName: "xray-report"
+        publishLocation: "Container"
+
+    # ------------------------------
+    # CLEANUP DOCKER (ALWAYS RUN)
+    # ------------------------------
+    - script: |
+        echo "Removing built image: $(FULL_IMAGE)"
+        docker rmi "$(FULL_IMAGE)" || true
+      displayName: Cleanup Docker on agent
+      condition: always()
+
+    # Handed to a human queuing dpn-portal-image-cd.yaml next — that pipeline
+    # takes this exact value as its required `imageTag` parameter (see the
+    # split explained at the top of this file). Not auto-chained, same as
+    # dpn-file-scan-service-cd.yml.
+    - script: |
+        echo "=========================================="
+        echo "Image pushed: $(FULL_IMAGE)"
+        echo "Digest: $(FULL_IMAGE_DIGEST)"
+        echo ""
+        echo "To deploy, queue dpn-portal-image-cd.yaml with:"
+        echo "  imageTag = $(IMAGE_TAG)"
+        echo "=========================================="
+      displayName: Print imageTag for CD

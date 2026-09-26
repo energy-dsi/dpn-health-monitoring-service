@@ -1,0 +1,115 @@
+# ===========================================================================
+# Per-cluster values for the dpn01 AKS cluster (see .pipelines/azure-
+# pipelines/config/dev-dpn01.json for that cluster's registry/subscription).
+# Full copy of values.yaml as of the split into per-cluster files — every
+# field below currently resolves to the exact same in-cluster DNS names on
+# both dpn01 and dpn02 since they share the same namespace name
+# (ns-dpn-health-01), so nothing has actually diverged yet. Edit THIS file
+# when dpn01 needs a value the other cluster doesn't share; values.yaml
+# stays the template/reference copy and is what `helm lint`/local runs fall
+# back to when no -f is given. See values.yaml's own header comments for the
+# rationale behind each field — not repeated here to avoid drift between
+# three copies of the same prose.
+# ===========================================================================
+
+namespace: ns-dpn-health-01
+name: dpn-portal
+
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+keycloak:
+  publicUrl: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+  realm: dpn-realm
+
+externalUrl: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8443"
+
+otherUiUrls:
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601"   # opensearch
+  - "https://dpn-kafka-ui-external.ns-dpn-01.svc.cluster.local:8086"   # kafka-ui
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8082"   # kafka-ui-2
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:16686"  # jaeger
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8083"   # perses
+  - "https://dpn-airflow-webserver-external.ns-dpn-01.svc.cluster.local:8080"   # airflow
+  - "http://dpn-federator-client-1-external.ns-dpn-01.svc.cluster.local:8085" #Job runner
+  - "https://dpn-vault-https-lb.ns-dpn-01.svc.cluster.local:8200" #Vault
+
+tiles:
+  - name: Users & Roles
+    subtitle: ""
+    description: Manage DPN users, groups, and role assignments in Keycloak.
+    icon: users
+    variant: alt
+    groups: ["dpnadmin"]
+    components:
+      - name: Keycloak Console
+        url: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+  - name: Data
+    subtitle: Store
+    description: Logical storage location for Data Products that are ready for sharing
+    icon: kafka
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: DPN Kafka
+        url: "https://dpn-kafka-ui-external.ns-dpn-01.svc.cluster.local:8086"
+  - name: Gateway
+    subtitle: ""
+    description: Manage the secure and controlled exposure of Data Products to authorised Consumers
+    icon: gateway
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: GRPC Gateway Client
+        url: "http://dpn-federator-client-1-external.ns-dpn-01.svc.cluster.local:8085"
+  - name: Data
+    subtitle: Pipeline
+    description: Manage your pipelines.
+    icon: airflow
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: Pipeline Orchestrator
+        url: "https://dpn-airflow-webserver-external.ns-dpn-01.svc.cluster.local:8080"
+  - name: Security
+    subtitle: Services
+    description: Provides the foundational security capabilities required to support authentication, authorisation, and policy enforcement within the DPN.
+    icon: security
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: Certification Vault Service
+        url: "https://dpn-vault-https-lb.ns-dpn-01.svc.cluster.local:8200"
+  - name: Health
+    subtitle: Monitoring Service
+    description: Supports the visibility and auditability of a Participant's compliance with DSI operational and behavioural requirement
+    icon: health
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: Log Stack
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601"
+        probe_url: "https://dpn-oauth2-proxy-osd.ns-dpn-health-01.svc.cluster.local:5601"
+      - name: Traces Stack
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:16686"
+        probe_url: "https://dpn-oauth2-proxy-jaeger.ns-dpn-health-01.svc.cluster.local:16686"
+      - name: Metrics Dashboard
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8083"
+        probe_url: "https://dpn-oauth2-proxy-perses.ns-dpn-health-01.svc.cluster.local:8083"
+      - name: Collector Stack
+        url: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8082"
+        probe_url: "https://dpn-kafka-health-ui.ns-dpn-health-01.svc.cluster.local:8082"
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi

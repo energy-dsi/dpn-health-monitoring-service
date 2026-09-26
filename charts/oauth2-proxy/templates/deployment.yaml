@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.name }}
+      annotations:
+        # Roll the pods when the rendered config changes — a ConfigMap update
+        # alone would otherwise leave the running proxy on the old settings.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: oauth2-proxy
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
+
+          env:
+            # Both arrive as env vars rather than config-file entries so the
+            # ConfigMap stays safe to read with `kubectl get cm -o yaml`.
+            #
+            # The client credential is read from the Secret the CSI driver
+            # mirrors from Key Vault (see templates/secretproviderclass.yaml).
+            # Nothing in the deploy path ever handles its value — it is never
+            # passed through --set, never rendered into a template, and never
+            # at risk of being echoed into a build log.
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "oauth2-proxy.akvSecretName" . }}
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "oauth2-proxy.cookieSecretName" . }}
+                  key: cookie-secret
+
+          ports:
+            # The only port that binds. oauth2-proxy drops its plain-HTTP
+            # listener entirely when a TLS cert is configured, so there is no
+            # 4180 to declare here.
+            - name: https
+              containerPort: 4443
+
+          # Probes must therefore speak HTTPS. kubelet does not verify the
+          # server certificate on an HTTPS probe, so the cert being issued for
+          # the browser-facing address rather than the pod IP does not matter.
+          #
+          # /ping is oauth2-proxy's unauthenticated health endpoint — it is
+          # exempt from the OIDC flow, so a probe never gets bounced to
+          # Keycloak.
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 4443
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 4443
+              scheme: HTTPS
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/oauth2-proxy
+              readOnly: true
+            # One mount, three files: tls.crt + tls.key serve the browser,
+            # ca.crt verifies Keycloak.
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            # Not read directly — mounting it is what makes the CSI driver
+            # mirror the Key Vault value into the akvSecretName Secret that
+            # OAUTH2_PROXY_CLIENT_SECRET above actually reads. See
+            # templates/secretproviderclass.yaml.
+            - name: keycloak-secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Values.name }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tlsSecretName }}
+        - name: keycloak-secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.name }}-kv-secrets

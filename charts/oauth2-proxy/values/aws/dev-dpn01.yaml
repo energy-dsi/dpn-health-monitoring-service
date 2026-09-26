@@ -1,0 +1,74 @@
+# =============================================================================
+# oauth2-proxy — AWS dev-dpn01 per-cluster values
+# EKS     : <<your specific value>>
+# Account : <<your specific value>>
+# Region  : eu-west-2
+#
+# Content mirrors ../test-dpn01.yaml (deterministic substitution of
+# account/cluster/prefix identifiers only) — see that file for the
+# confirmed-working AWS pattern this is derived from.
+#
+# STATUS: draft. dpn-cd-oauth2-proxy.yml's "Provision AWS IRSA Role +
+# Secret" step (cloud=aws) creates the IRSA role and copies the real
+# KC-SERVICE-CLIENT-SECRET value from keycloak's own secret into
+# secretsManager.secretPrefix inline, before deploy — no manual step needed.
+# Still open:
+#   1. service.loadBalancerIP is cleared here because every per-component
+#      values-<x>.yaml hardcodes Azure's dev-dpn01 static IP
+#      (10.226.121.10) — the exact address that caused
+#      PrivateIPAddressNotInSubnet on other Azure clusters, and it has no
+#      meaning at all on an AWS NLB (this cluster being named dev-dpn01 too
+#      does not make that IP valid here — it is still an Azure address).
+#      Leave empty so AWS assigns a fresh dynamic address; pin a real one
+#      here later if this namespace ever reserves a static NLB IP on AWS.
+# =============================================================================
+
+cloudProvider: aws
+
+namespace: ns-dpn-health-01
+
+# Overrides the base values.yaml's keycloak.publicUrl, which is still the
+# in-cluster ClusterIP DNS name (browser can't resolve *.svc.cluster.local)
+# rather than Keycloak's own LoadBalancer -- same DNS_PROBE_FINISHED_NXDOMAIN
+# gap confirmed on dev-dpn02 2026-09-17, fixed here the same way.
+# Real hostname confirmed via:
+#   kubectl get svc dpn-keycloak-service-lb -n ns-dpn-01 \
+#     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+#
+# issuerUrl: _helpers.tpl's oauth2-proxy.issuerUrl assumes the token's `iss`
+# claim reflects the redeem call's own hostname (internal, since oauth2-proxy
+# calls Keycloak in-cluster) -- confirmed WRONG on dev-dpn02: Keycloak
+# actually stamps `iss` from the ORIGINAL /auth request's hostname (the
+# public LB, since the browser used it), not the later redeem call. Must
+# equal publicUrl above or every login fails on issuer mismatch.
+keycloak:
+  publicUrl: "https://k8s-nsdpn01-dpnkeycl-fa70c09618-32c5d488b41f8a9b.elb.eu-west-2.amazonaws.com:8443"
+  issuerUrl: "https://k8s-nsdpn01-dpnkeycl-fa70c09618-32c5d488b41f8a9b.elb.eu-west-2.amazonaws.com:8443"
+
+imagePullSecret: ""
+
+serviceAccount:
+  create: true
+  irsaRoleArn: "<<your specific value>>"
+
+secretsManager:
+  secretPrefix: "dpn/dev-dpn01/oauth2-proxy"
+
+service:
+  loadBalancerIP: <<your specific value>>
+  # Helm deep-merges maps across -f files rather than replacing them, so the
+  # per-component values-<x>.yaml's azure-load-balancer-internal annotation
+  # must be explicitly nulled out here or it leaks into the AWS Service
+  # alongside the aws-load-balancer-* ones below.
+  # NOTE: aws-load-balancer-name is deliberately NOT set here. It does not
+  # merge multiple Services onto one NLB — it just claims that literal name
+  # for whichever Service creates its LB first; every other Service reusing
+  # the same name is permanently rejected with DuplicateLoadBalancerName,
+  # confirmed live 2026-09-10 by infra on test-dpn01. Sharing one LB across
+  # Services needs an ALB + Ingress, not this annotation. Each Service below
+  # gets its own controller-auto-named NLB instead, matching how everything
+  # in ns-dpn-01 already works.
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: null
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"

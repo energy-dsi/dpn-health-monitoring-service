@@ -1,0 +1,447 @@
+name: DPN CD - OpenSearch
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      cluster:
+        required: true
+        type: string
+      cloud:
+        required: true
+        type: string
+      ACR_NAME:
+        required: true
+        type: string
+      BASE_REGISTRY:
+        required: true
+        type: string
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      RESOURCE_GROUP:
+        required: true
+        type: string
+      AKS_CLUSTER:
+        required: true
+        type: string
+      KEY_VAULT_NAME:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      AWS_REGION:
+        required: false
+        type: string
+      AWS_ACCOUNT_ID:
+        required: false
+        type: string
+      EKS_CLUSTER:
+        required: false
+        type: string
+      opensearchImageRepository:
+        required: false
+        type: string
+        default: ""
+      opensearchImageTag:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy OpenSearch
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Export Config as Env Vars
+        shell: bash
+        run: |
+          echo "ACR_NAME=${{ inputs.ACR_NAME }}" >> "$GITHUB_ENV"
+          echo "BASE_REGISTRY=${{ inputs.BASE_REGISTRY }}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "RESOURCE_GROUP=${{ inputs.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER=${{ inputs.AKS_CLUSTER }}" >> "$GITHUB_ENV"
+          echo "KEY_VAULT_NAME=${{ inputs.KEY_VAULT_NAME }}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${{ inputs.NAMESPACE }}" >> "$GITHUB_ENV"
+          echo "ARM_SUBSCRIPTION_ID=${{ inputs.ARM_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ inputs.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=${{ inputs.AWS_ACCOUNT_ID }}" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER=${{ inputs.EKS_CLUSTER }}" >> "$GITHUB_ENV"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Verify Cluster Access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm ls -n "$NAMESPACE"
+          kubectl get all -n "$NAMESPACE"
+
+      - name: Deploy OpenSearch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HELM_DIR="dpn-health-monitoring/charts/opensearch"
+          VALUES_FILE="dpn-health-monitoring/charts/opensearch/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+          DPN_RESOURCES_FILE="dpn-health-monitoring/charts/opensearch/opensearch-dpn-health-resources.yaml"
+          RELEASE_NAME="dpn-opensearch"
+
+          # dashboard-init-job.yaml / opensearch-dpn-health-resources.yaml are
+          # plain manifests (not Helm-templated), hardcoded to the Azure pull
+          # secret name (ghcr-pull-secret-new) -- substitute it for the AWS
+          # one at apply time rather than maintaining two copies of the file.
+          if [ "${{ inputs.cloud }}" == "aws" ]; then
+            PULL_SECRET_NAME="ghcr-pull-secret"
+          else
+            PULL_SECRET_NAME="ghcr-pull-secret-new"
+          fi
+
+          echo "HELM_DIR=$HELM_DIR"
+          echo "VALUES_FILE=$VALUES_FILE"
+          echo "DPN_RESOURCES_FILE=$DPN_RESOURCES_FILE"
+          echo "RELEASE_NAME=$RELEASE_NAME"
+
+          if [ ! -d "$HELM_DIR" ]; then
+            echo "OpenSearch chart directory missing: $HELM_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$HELM_DIR/Chart.yaml" ]; then
+            echo "OpenSearch Chart.yaml missing: $HELM_DIR/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -d "$HELM_DIR/templates" ]; then
+            echo "OpenSearch templates directory missing: $HELM_DIR/templates"
+            echo "This usually means the real OpenSearch chart was not vendored correctly."
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "OpenSearch values file missing: $VALUES_FILE"
+            exit 1
+          fi
+
+          if [ ! -f "$DPN_RESOURCES_FILE" ]; then
+            echo "OpenSearch DPN health resources file missing: $DPN_RESOURCES_FILE"
+            exit 1
+          fi
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.opensearchImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.opensearchImageRepository }}")
+          fi
+          if [ -n "${{ inputs.opensearchImageTag }}" ]; then
+            EXTRA_ARGS+=(--set image.tag="${{ inputs.opensearchImageTag }}")
+          fi
+
+          echo "========================================"
+          echo "Linting OpenSearch chart..."
+          echo "========================================"
+
+          helm lint "$HELM_DIR" -f "$VALUES_FILE" "${EXTRA_ARGS[@]}"
+
+          echo "========================================"
+          echo "Rendering OpenSearch chart..."
+          echo "========================================"
+
+          helm template "$RELEASE_NAME" "$HELM_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            "${EXTRA_ARGS[@]}" \
+            --debug > /tmp/opensearch-rendered.yaml
+
+          echo "Rendered OpenSearch resources:"
+          grep "^kind:" /tmp/opensearch-rendered.yaml || true
+
+          echo "Checking expected OpenSearch StatefulSet/service names..."
+          grep -n "name: dpn-opensearch-health" /tmp/opensearch-rendered.yaml || true
+          grep -n "name: dpn-opensearch-health-headless" /tmp/opensearch-rendered.yaml || true
+
+          echo "Checking security plugin disabled config..."
+          grep -n "plugins.security.disabled" /tmp/opensearch-rendered.yaml || true
+          grep -n "DISABLE_SECURITY_PLUGIN" /tmp/opensearch-rendered.yaml || true
+
+          echo "========================================"
+          echo "Deploying OpenSearch Helm chart..."
+          echo "========================================"
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            # NOTE: no --wait here. Long-lived Helm watches against the EKS
+            # API from this runner are unreliable and time out even when the
+            # rollout completes successfully on the cluster — see
+            # certificate-manager-cd.yml. Poll rollout status separately below.
+            helm upgrade --install "$RELEASE_NAME" "$HELM_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --debug
+          else
+            helm upgrade --install "$RELEASE_NAME" "$HELM_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --wait \
+              --timeout 20m \
+              --debug
+          fi
+
+          echo "========================================"
+          echo "Waiting for OpenSearch StatefulSet rollout..."
+          echo "========================================"
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            ROLLOUT_OK=false
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if kubectl rollout status statefulset/dpn-opensearch-health -n "$NAMESPACE" --timeout=90s; then
+                ROLLOUT_OK=true
+                break
+              fi
+              echo "Rollout status attempt $attempt/10 did not complete within 90s — retrying..."
+              sleep 10
+            done
+            if [ "$ROLLOUT_OK" != "true" ]; then
+              echo "::error::StatefulSet dpn-opensearch-health did not report ready after 10 attempts."
+              exit 1
+            fi
+          else
+            kubectl rollout status statefulset/dpn-opensearch-health \
+              -n "$NAMESPACE" \
+              --timeout=900s
+          fi
+
+          echo "========================================"
+          echo "Checking OpenSearch core endpoints..."
+          echo "========================================"
+
+          kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+          kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE"
+
+          # Verify port 9200 has a READY backend. Use jsonpath, NOT
+          # `grep :9200` on the table — kubectl truncates the ENDPOINTS
+          # column with "+ N more..." and can hide 9200, causing a false
+          # failure even when the port is healthy.
+          if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" \
+               -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "9200"; then
+            echo "OpenSearch core service has no ready backend on port 9200"
+            kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" -o wide || true
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Preparing DPN OpenSearch health resources..."
+          echo "========================================"
+
+          echo "Deleting completed init jobs so they can be recreated cleanly..."
+          kubectl delete job dpn-opensearch-init-health \
+            -n "$NAMESPACE" \
+            --ignore-not-found
+
+          kubectl delete job dpn-opensearch-alerting-init \
+            -n "$NAMESPACE" \
+            --ignore-not-found
+
+          echo "Applying DPN OpenSearch health resources..."
+          sed "s/ghcr-pull-secret-new/$PULL_SECRET_NAME/g" "$DPN_RESOURCES_FILE" | kubectl apply -f -
+
+          echo "========================================"
+          echo "Waiting for DPN OpenSearch dashboard rollout..."
+          echo "========================================"
+
+          kubectl rollout status deployment/dpn-opensearch-dashboard-health \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+          echo "========================================"
+          echo "Waiting for DPN OpenSearch init jobs..."
+          echo "========================================"
+
+          kubectl wait --for=condition=complete job/dpn-opensearch-init-health \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+          kubectl wait --for=condition=complete job/dpn-opensearch-alerting-init \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+          echo "========================================"
+          echo "OpenSearch resources:"
+          echo "========================================"
+
+          kubectl get pods -n "$NAMESPACE" | grep opensearch || true
+          kubectl get svc -n "$NAMESPACE" | grep opensearch || true
+          kubectl get pvc -n "$NAMESPACE" | grep opensearch || true
+          kubectl get statefulset -n "$NAMESPACE" | grep opensearch || true
+          kubectl get jobs -n "$NAMESPACE" | grep opensearch || true
+
+          echo "========================================"
+          echo "OpenSearch endpoints:"
+          echo "========================================"
+
+          kubectl get endpoints -n "$NAMESPACE" | grep opensearch || true
+
+          echo "========================================"
+          echo "Validating DPN OpenSearch services..."
+          echo "========================================"
+
+          kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+          kubectl get svc dpn-opensearch-health-ui -n "$NAMESPACE"
+          kubectl get svc dpn-opensearch-dashboard-health -n "$NAMESPACE"
+
+          if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" \
+               -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "9200"; then
+            echo "dpn-opensearch-health has no ready backend on port 9200"
+            kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" -o wide || true
+            exit 1
+          fi
+
+          if ! kubectl get endpoints dpn-opensearch-health-ui -n "$NAMESPACE" \
+               -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "9200"; then
+            echo "dpn-opensearch-health-ui has no ready backend on port 9200"
+            kubectl get endpoints dpn-opensearch-health-ui -n "$NAMESPACE" -o wide || true
+            exit 1
+          fi
+
+          if ! kubectl get endpoints dpn-opensearch-dashboard-health -n "$NAMESPACE" \
+               -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "5601"; then
+            echo "dpn-opensearch-dashboard-health has no ready backend on port 5601"
+            kubectl get endpoints dpn-opensearch-dashboard-health -n "$NAMESPACE" -o wide || true
+            exit 1
+          fi
+
+          # kubectl run --attach needs a long-lived streaming connection to
+          # the EKS API server to relay the pod's output live, and (like Helm
+          # --wait elsewhere in this repo — see dpn-cd-oauth2-proxy.yml) that
+          # kind of connection is unreliable from this runner and can time out
+          # even when the underlying check actually succeeded. Run detached
+          # and poll for completion instead, then fetch the buffered logs in
+          # one shot.
+          run_ephemeral_pod() {
+            local pod_name="$1"
+            local cmd="$2"
+
+            kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s
+
+            # Public image, not a GHCR mirror: kubectl run gives this pod no
+            # imagePullSecret, so a private <<your specific value>>/* reference
+            # fails ImagePullBackOff/401 with no way to authenticate. Same
+            # public image dpn-cd-oauth2-proxy.yml's own ephemeral test pods
+            # already use successfully.
+            kubectl run "$pod_name" \
+              -n "$NAMESPACE" \
+              --image=curlimages/curl:8.8.0 \
+              --restart=Never \
+              --command -- sh -c "$cmd"
+
+            local phase=""
+            for attempt in $(seq 1 30); do
+              phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+                break
+              fi
+              sleep 2
+            done
+
+            echo "--- $pod_name logs ---"
+            kubectl logs "$pod_name" -n "$NAMESPACE" || true
+            echo "--- end logs (final phase: ${phase:-unknown}) ---"
+
+            kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false
+
+            [ "$phase" = "Succeeded" ]
+          }
+
+          echo "========================================"
+          echo "Testing OpenSearch cluster health..."
+          echo "========================================"
+
+          if ! run_ephemeral_pod opensearch-curl-test "curl -fsS http://dpn-opensearch-health:9200/_cluster/health"; then
+            echo "::error::OpenSearch cluster health check did not succeed."
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Testing OpenSearch Dashboards endpoint..."
+          echo "========================================"
+
+          run_ephemeral_pod opensearch-dashboard-curl-test "curl -I --max-time 10 http://dpn-opensearch-dashboard-health:5601" || true
+
+          echo "========================================"
+          echo "Provisioning DPN dashboard saved objects..."
+          echo "========================================"
+
+          DASHBOARD_PROVISIONING_DIR="dpn-health-monitoring/config/opensearch/dashboard-provisioning"
+          INDEX_TEMPLATE_FILE="dpn-health-monitoring/config/opensearch/otel-logs-index-template.json"
+          DASHBOARD_INIT_JOB_FILE="dpn-health-monitoring/charts/opensearch/dashboard-init-job.yaml"
+
+          if [ ! -f "$DASHBOARD_PROVISIONING_DIR/log-status-dashboard.ndjson" ]; then
+            echo "Dashboard ndjson missing: $DASHBOARD_PROVISIONING_DIR/log-status-dashboard.ndjson"
+            exit 1
+          fi
+
+          if [ ! -f "$INDEX_TEMPLATE_FILE" ]; then
+            echo "Index template missing: $INDEX_TEMPLATE_FILE"
+            exit 1
+          fi
+
+          if [ ! -f "$DASHBOARD_INIT_JOB_FILE" ]; then
+            echo "Dashboard init Job manifest missing: $DASHBOARD_INIT_JOB_FILE"
+            exit 1
+          fi
+
+          echo "Refreshing dashboard provisioning ConfigMap..."
+          kubectl create configmap dpn-dashboard-provisioning-files \
+            --from-file=log-status-dashboard.ndjson="$DASHBOARD_PROVISIONING_DIR/log-status-dashboard.ndjson" \
+            --from-file=otel-logs-index-template.json="$INDEX_TEMPLATE_FILE" \
+            --from-file=init-opensearch-dashboard.sh="$DASHBOARD_PROVISIONING_DIR/init-opensearch-dashboard.sh" \
+            -n "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Deleting previous dashboard-init Job so it can be recreated cleanly..."
+          kubectl delete job dpn-dashboard-init \
+            -n "$NAMESPACE" \
+            --ignore-not-found
+
+          echo "Applying dashboard-init Job..."
+          sed "s/ghcr-pull-secret-new/$PULL_SECRET_NAME/g" "$DASHBOARD_INIT_JOB_FILE" | kubectl apply -f -
+
+          echo "Waiting for dashboard-init Job to complete..."
+          kubectl wait --for=condition=complete job/dpn-dashboard-init \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+          echo "Dashboard init Job logs:"
+          kubectl logs -n "$NAMESPACE" -l app=dpn-dashboard-init --tail=100
+
+          echo "========================================"
+          echo "Recent OpenSearch events:"
+          echo "========================================"
+
+          kubectl get events -n "$NAMESPACE" \
+            --sort-by=.metadata.creationTimestamp | grep -i opensearch | tail -30 || true
+
+          echo "OpenSearch deployment completed."

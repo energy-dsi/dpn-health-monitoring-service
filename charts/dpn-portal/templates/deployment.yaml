@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: {{ .Values.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.name }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # Must match the `useradd -u 10001` in app/dpn-portal/Dockerfile —
+        # not an arbitrary UID. readOnlyRootFilesystem below means the
+        # container never gets a chance to self-correct a mismatched owner.
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: dpn-portal
+          image: "{{ required "image.repository is required: the registry path app/dpn-portal is published to (see charts/dpn-portal/values.yaml)" .Values.image.repository }}:{{ required "image.tag is required" .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          env:
+            # Same env var app/dpn-portal reads under docker-compose. JSON
+            # array of tile objects, each with a components: [{name, url}]
+            # list — see the comment on tiles: in values.yaml. toJson rather
+            # than hand-quoting, so a description containing a comma or quote
+            # can never break the value.
+            - name: TILES_CONFIG
+              value: {{ toJson .Values.tiles | quote }}
+            # Builds the real Keycloak-logout redirect in main.py's
+            # _logout_url — see the comment on keycloak: in values.yaml for
+            # why this chart needs its own copy of these two values.
+            - name: KEYCLOAK_PUBLIC_URL
+              value: {{ .Values.keycloak.publicUrl | quote }}
+            - name: KEYCLOAK_REALM
+              value: {{ .Values.keycloak.realm | quote }}
+            - name: PORTAL_EXTERNAL_URL
+              value: {{ .Values.externalUrl | quote }}
+            # Every other UI's oauth2-proxy sign_out beacon target — see the
+            # comment on otherUiUrls in values.yaml and _other_ui_urls in
+            # main.py for why logout needs this to reach every UI, not just
+            # this one.
+            - name: OTHER_UI_URLS
+              value: {{ join "," .Values.otherUiUrls | quote }}
+
+          ports:
+            - name: http
+              containerPort: 8000
+
+          # /healthz, not / — the root route renders the tile page (reads
+          # X-Forwarded-Groups, loads TILES_CONFIG, runs the Jinja2 template)
+          # on every kubelet check, which is unnecessary work and pulls
+          # unrelated failure modes into liveness/readiness.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+
+          resources:
+{{ toYaml .Values.resources | indent 12 }}

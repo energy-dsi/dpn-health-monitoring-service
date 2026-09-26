@@ -1,0 +1,661 @@
+name: DPN CD - OAuth2 Proxy (Keycloak Gateway)
+
+# Deploys one oauth2-proxy release — the Keycloak gateway in front of a single
+# observability UI — plus, idempotently, the shared dpn-redis-ui-health
+# session store every release depends on. Called once per component by
+# dpn-health-monitoring-azure-cd-install.yml.
+#
+# Ported from dpn-health-monitoring-service's
+# .pipelines/azure-pipelines/scripts/deploy-oauth2-proxy.sh — see
+# dpn-health-monitoring/charts/oauth2-proxy/README.md for the full design
+# rationale (cross-namespace Keycloak, split-horizon issuer, DNS/TLS
+# requirements).
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      cluster:
+        required: true
+        type: string
+      cloud:
+        required: true
+        type: string
+      ACR_NAME:
+        required: true
+        type: string
+      BASE_REGISTRY:
+        required: true
+        type: string
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      RESOURCE_GROUP:
+        required: true
+        type: string
+      AKS_CLUSTER:
+        required: true
+        type: string
+      KEY_VAULT_NAME:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      AWS_REGION:
+        required: false
+        type: string
+      AWS_ACCOUNT_ID:
+        required: false
+        type: string
+      EKS_CLUSTER:
+        required: false
+        type: string
+      component:
+        description: "Which UI this proxy fronts: opensearch | jaeger | perses | portal"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy oauth2-proxy (${{ inputs.component }})
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Export Config as Env Vars
+        shell: bash
+        run: |
+          echo "ACR_NAME=${{ inputs.ACR_NAME }}" >> "$GITHUB_ENV"
+          echo "BASE_REGISTRY=${{ inputs.BASE_REGISTRY }}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "RESOURCE_GROUP=${{ inputs.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER=${{ inputs.AKS_CLUSTER }}" >> "$GITHUB_ENV"
+          echo "KEY_VAULT_NAME=${{ inputs.KEY_VAULT_NAME }}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${{ inputs.NAMESPACE }}" >> "$GITHUB_ENV"
+          echo "ARM_SUBSCRIPTION_ID=${{ inputs.ARM_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ inputs.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=${{ inputs.AWS_ACCOUNT_ID }}" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER=${{ inputs.EKS_CLUSTER }}" >> "$GITHUB_ENV"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Resolve Component Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMPONENT="${{ inputs.component }}"
+          UPSTREAM_NS="$NAMESPACE"
+
+          case "$COMPONENT" in
+            opensearch)
+              RELEASE_NAME="dpn-oauth2-proxy-osd"
+              UPSTREAM_SVC="dpn-opensearch-dashboard-health"
+              UPSTREAM_PORT=5601
+              SERVICE_PORT=5601
+              VALUES_SUFFIX="opensearch"
+              ;;
+            jaeger)
+              RELEASE_NAME="dpn-oauth2-proxy-jaeger"
+              UPSTREAM_SVC="dpn-jaeger-query-health"
+              UPSTREAM_PORT=16686
+              SERVICE_PORT=16686
+              VALUES_SUFFIX="jaeger"
+              ;;
+            perses)
+              RELEASE_NAME="dpn-oauth2-proxy-perses"
+              UPSTREAM_SVC="dpn-perses-health"
+              UPSTREAM_PORT=8083
+              SERVICE_PORT=8083
+              VALUES_SUFFIX="perses"
+              ;;
+            portal)
+              RELEASE_NAME="dpn-oauth2-proxy-portal"
+              UPSTREAM_SVC="dpn-portal"
+              UPSTREAM_PORT=8000
+              SERVICE_PORT=8443
+              VALUES_SUFFIX="portal"
+              ;;
+            *)
+              echo "::error::Unknown component '$COMPONENT'. Add it to this case statement and to dpn-health-monitoring/charts/oauth2-proxy/README.md."
+              exit 1
+              ;;
+          esac
+
+          echo "RELEASE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SVC=$UPSTREAM_SVC" >> "$GITHUB_ENV"
+          echo "UPSTREAM_NS=$UPSTREAM_NS" >> "$GITHUB_ENV"
+          echo "UPSTREAM_PORT=$UPSTREAM_PORT" >> "$GITHUB_ENV"
+          echo "SERVICE_PORT=$SERVICE_PORT" >> "$GITHUB_ENV"
+          echo "VALUES_SUFFIX=$VALUES_SUFFIX" >> "$GITHUB_ENV"
+
+          echo "RELEASE_NAME=$RELEASE_NAME"
+          echo "UPSTREAM_SVC=$UPSTREAM_SVC (namespace: $UPSTREAM_NS)"
+          echo "UPSTREAM_PORT=$UPSTREAM_PORT SERVICE_PORT=$SERVICE_PORT"
+
+      - name: Ensure Shared Redis Session Store
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Idempotent: the first component to run creates dpn-redis-ui-health,
+          # every other component's run is a no-op update. Never folded into a
+          # single oauth2-proxy release — see charts/oauth2-proxy-redis/values.yaml.
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            # NOTE: no --wait here. Long-lived Helm watches against the EKS
+            # API from this runner are unreliable and time out even when the
+            # rollout completes successfully on the cluster — see
+            # certificate-manager-cd.yml.
+            helm upgrade --install dpn-redis-ui-health \
+              dpn-health-monitoring/charts/oauth2-proxy-redis \
+              --namespace "$NAMESPACE"
+
+            ROLLOUT_OK=false
+            for attempt in 1 2 3 4 5; do
+              if kubectl rollout status deployment/dpn-redis-ui-health -n "$NAMESPACE" --timeout=60s 2>/dev/null; then
+                ROLLOUT_OK=true
+                break
+              fi
+              echo "Rollout status attempt $attempt/5 for dpn-redis-ui-health did not complete within 60s — retrying..."
+              sleep 10
+            done
+            if [ "$ROLLOUT_OK" != "true" ]; then
+              echo "::error::dpn-redis-ui-health did not report ready after 5 attempts."
+              exit 1
+            fi
+          else
+            helm upgrade --install dpn-redis-ui-health \
+              dpn-health-monitoring/charts/oauth2-proxy-redis \
+              --namespace "$NAMESPACE" \
+              --wait \
+              --timeout 2m
+          fi
+
+      - name: Verify TLS Secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TLS_SECRET="dpn-health-tls"
+
+          if ! kubectl get secret "$TLS_SECRET" -n "$NAMESPACE" >/dev/null 2>&1; then
+            echo "::error::secret/$TLS_SECRET not found in namespace $NAMESPACE. It must be a kubernetes.io/tls Secret holding tls.crt, tls.key and ca.crt."
+            exit 1
+          fi
+
+          TLS_KEYS="$(kubectl get secret "$TLS_SECRET" -n "$NAMESPACE" -o json | jq -r '.data // {} | keys[]')"
+
+          for KEY in tls.crt tls.key ca.crt; do
+            if ! printf '%s\n' "$TLS_KEYS" | grep -qx "$KEY"; then
+              echo "::error::secret/$TLS_SECRET has no '$KEY'. It holds: $(printf '%s ' $TLS_KEYS)"
+              exit 1
+            fi
+          done
+
+          echo "secret/$TLS_SECRET has tls.crt, tls.key and ca.crt."
+
+      - name: Verify Keycloak Client Secret Exists in Key Vault
+        if: ${{ inputs.cloud == 'azure' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Presence check only. The value is never read, never printed, never
+          # passed to helm — the pod resolves it itself once the CSI driver
+          # mirrors it into a Secret from the SecretProviderClass this chart
+          # renders.
+          AKV_OBJECT_NAME="KC-SERVICE-CLIENT-SECRET"
+
+          if ! az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$AKV_OBJECT_NAME" >/dev/null 2>&1; then
+            echo "::error::secret '$AKV_OBJECT_NAME' not found in Key Vault '$KEY_VAULT_NAME'. It must hold the dpn-service-client credential from the Keycloak realm — create it once per environment with: az keyvault secret set --vault-name $KEY_VAULT_NAME --name $AKV_OBJECT_NAME --value '<dpn-service-client secret>'"
+            exit 1
+          fi
+
+          echo "Key Vault secret '$AKV_OBJECT_NAME' exists in $KEY_VAULT_NAME."
+
+      - name: Verify Keycloak Client Secret Exists in Secrets Manager
+        if: ${{ inputs.cloud == 'aws' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Presence check only, same as the Azure step above — the value is
+          # never read here, only confirmed to exist. dpn-keycloak-cd.yml is
+          # what actually creates/owns this secret (its own AWS deploy path),
+          # at this exact prefix — reusing it rather than a new one.
+          SECRET_NAME="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/keycloak/KC_SERVICE_CLIENT_SECRET"
+
+          if ! aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
+            echo "::error::secret '$SECRET_NAME' not found in Secrets Manager. It must hold the dpn-service-client credential from the Keycloak realm — it's created by dpn-keycloak-cd.yml's own AWS deploy path; run that first if it hasn't been."
+            exit 1
+          fi
+
+          echo "Secrets Manager secret '$SECRET_NAME' exists."
+
+      ###################################################################
+      # AWS IRSA — IAM role for the oauth2-proxy ServiceAccount, and its own
+      # copy of the Keycloak client secret (oauth2-proxy's SecretProviderClass
+      # pulls from its own secretsManager.secretPrefix, not keycloak's — a
+      # separate object, same underlying value). Idempotent and shared across
+      # all 8 oauth2-proxy releases (component-independent), so safe to run
+      # on every call: creates the role/secret only if missing.
+      ###################################################################
+      - name: Provision AWS IRSA Role + Secret
+        if: ${{ inputs.cloud == 'aws' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROLE_NAME="dpn-oauth2-proxy-secrets-role"
+          SA_NAME="dpn-oauth2-proxy"
+          SECRET_PREFIX="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/oauth2-proxy"
+          OBJECT_NAME="KC-SERVICE-CLIENT-SECRET"
+
+          OIDC_ISSUER=$(aws eks describe-cluster \
+            --name "$EKS_CLUSTER" \
+            --region "$AWS_REGION" \
+            --query "cluster.identity.oidc.issuer" --output text)
+          OIDC_PROVIDER=${OIDC_ISSUER#https://}
+
+          cat > oauth2-proxy-trust-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OIDC_PROVIDER}:aud": "sts.amazonaws.com",
+                    "${OIDC_PROVIDER}:sub": "system:serviceaccount:${NAMESPACE}:${SA_NAME}"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          cat > oauth2-proxy-permissions-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+                "Resource": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${SECRET_PREFIX}/*"
+              }
+            ]
+          }
+          EOF
+
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Role $ROLE_NAME already exists — updating trust policy."
+            aws iam update-assume-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-document file://oauth2-proxy-trust-policy.json
+          else
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://oauth2-proxy-trust-policy.json
+            echo "Created role $ROLE_NAME."
+          fi
+
+          aws iam put-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name dpn-oauth2-proxy-permissions \
+            --policy-document file://oauth2-proxy-permissions-policy.json
+
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query "Role.Arn" --output text)
+          echo "IRSA role ready: $ROLE_ARN"
+          echo "Set this as serviceAccount.irsaRoleArn in dpn-health-monitoring/charts/oauth2-proxy/values/aws/test-dpn01.yaml"
+
+          TARGET_SECRET="$SECRET_PREFIX/$OBJECT_NAME"
+          if aws secretsmanager describe-secret --secret-id "$TARGET_SECRET" >/dev/null 2>&1; then
+            echo "Secret $TARGET_SECRET already exists — leaving value untouched."
+          else
+            # Copy the real value from keycloak's own secret (verified to exist
+            # by the previous step) rather than a placeholder — the value is
+            # genuinely retrievable, not fabricated.
+            SOURCE_SECRET="dpn/${{ inputs.environment }}-${{ inputs.cluster }}/keycloak/KC_SERVICE_CLIENT_SECRET"
+            CLIENT_SECRET_VALUE=$(aws secretsmanager get-secret-value \
+              --secret-id "$SOURCE_SECRET" \
+              --query SecretString --output text)
+            aws secretsmanager create-secret \
+              --name "$TARGET_SECRET" \
+              --secret-string "$CLIENT_SECRET_VALUE" >/dev/null
+            echo "Created $TARGET_SECRET (copied from $SOURCE_SECRET)."
+          fi
+
+      - name: Resolve External URL (AWS)
+        if: ${{ inputs.cloud == 'aws' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # values-$VALUES_SUFFIX.yaml hardcodes externalUrl to the shared
+          # internal dpn-observability.*.svc.cluster.local Service DNS name
+          # (the Azure-era pattern) -- browsers can't resolve that, and it's
+          # what oauth2-proxy sends as the OIDC redirect_uri. On AWS each
+          # release has its own real NLB hostname instead, so override
+          # externalUrl with that once this release's Service already exists
+          # (a first-ever deploy has no LB yet -- falls back to the chart's
+          # own default, same pattern as KC_UI_HOST_* in dpn-keycloak-cd.yml;
+          # this step's override then takes effect starting with the NEXT run).
+          HOST="$(kubectl get svc "$RELEASE_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+
+          if [ -n "$HOST" ]; then
+            echo "EXTERNAL_URL=https://$HOST:$SERVICE_PORT" >> "$GITHUB_ENV"
+            echo "Resolved externalUrl override: https://$HOST:$SERVICE_PORT"
+          else
+            echo "EXTERNAL_URL=" >> "$GITHUB_ENV"
+            echo "No existing LB hostname for $RELEASE_NAME yet -- externalUrl falls back to the chart's own default."
+          fi
+
+      - name: Verify Upstream Service Ready
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get svc "$UPSTREAM_SVC" -n "$UPSTREAM_NS"
+
+          if ! kubectl get svc "$UPSTREAM_SVC" -n "$UPSTREAM_NS" -o json \
+               | jq -e --arg p "$UPSTREAM_PORT" '[(.spec.ports // [])[].port | tostring] | index($p)' >/dev/null; then
+            echo "::error::svc/$UPSTREAM_SVC in $UPSTREAM_NS does not publish port $UPSTREAM_PORT."
+            kubectl get svc "$UPSTREAM_SVC" -n "$UPSTREAM_NS" -o jsonpath='{range .spec.ports[*]}  {.name} {.port} -> {.targetPort}{"\n"}{end}' || true
+            exit 1
+          fi
+
+          READY_COUNT="$(kubectl get endpointslices -n "$UPSTREAM_NS" \
+            -l "kubernetes.io/service-name=$UPSTREAM_SVC" -o json 2>/dev/null \
+            | jq '[.items[]?.endpoints[]? | select((.conditions.ready // true) == true)] | length' || echo 0)"
+
+          if [ "${READY_COUNT:-0}" -lt 1 ]; then
+            echo "::error::svc/$UPSTREAM_SVC in $UPSTREAM_NS has no ready backends."
+            kubectl get endpointslices -n "$UPSTREAM_NS" -l "kubernetes.io/service-name=$UPSTREAM_SVC" -o wide || true
+            exit 1
+          fi
+
+          echo "svc/$UPSTREAM_SVC publishes $UPSTREAM_PORT with $READY_COUNT ready backend(s)."
+
+      - name: Verify Keycloak Issuer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_DIR="dpn-health-monitoring/charts/oauth2-proxy"
+          VALUES_FILE="$CHART_DIR/values-$VALUES_SUFFIX.yaml"
+          ENV_VALUES_FILE="$CHART_DIR/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+
+          if [ ! -f "$ENV_VALUES_FILE" ]; then
+            echo "::error::Per-cluster oauth2-proxy values file missing: $ENV_VALUES_FILE. This chart needs akv.keyvaultName/tenantId/userAssignedIdentityID for this cluster's managed identity before it can deploy here."
+            exit 1
+          fi
+
+          KEYCLOAK_INTERNAL_URL="$(helm template throwaway "$CHART_DIR" -f "$VALUES_FILE" -f "$ENV_VALUES_FILE" --show-only templates/configmap.yaml 2>/dev/null | sed -n 's/.*redeem_url = "\(https:\/\/[^\/]*\)\/realms\/.*/\1/p')"
+          REALM="$(awk '/^  realm:/ {sub(/^  realm:[[:space:]]*/,""); gsub(/"/,""); print; exit}' "$CHART_DIR/values.yaml")"
+          ISSUER_URL="$(helm template throwaway "$CHART_DIR" -f "$VALUES_FILE" -f "$ENV_VALUES_FILE" --show-only templates/configmap.yaml 2>/dev/null | sed -n 's/.*oidc_issuer_url = "\(.*\)\/realms\/.*/\1/p')"
+
+          KEYCLOAK_INTERNAL_URL="${KEYCLOAK_INTERNAL_URL:-https://dpn-keycloak.ns-dpn-01.svc.cluster.local:8443}"
+          REALM="${REALM:-dpn-realm}"
+          ISSUER_URL="${ISSUER_URL:-$KEYCLOAK_INTERNAL_URL}"
+
+          echo "internalUrl = $KEYCLOAK_INTERNAL_URL (token redeem, JWKS)"
+          echo "issuer      = $ISSUER_URL (expected in the token's iss claim)"
+
+          # kubectl run --attach needs a long-lived streaming connection to
+          # the EKS API server to relay the pod's output live, and (like Helm
+          # --wait elsewhere in this repo) that kind of connection is
+          # unreliable from this runner and can time out even when the
+          # underlying check actually succeeded (see dpn-cd-opensearch.yml,
+          # which hit this for real). Run detached and poll for completion
+          # instead. All housekeeping output goes to stderr so only the pod's
+          # actual log output lands on stdout, safe to capture with $(...).
+          run_ephemeral_pod() {
+            local pod_name="$1"
+            local image="$2"
+            local cmd="$3"
+
+            kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s >&2
+
+            kubectl run "$pod_name" -n "$NAMESPACE" \
+              --image="$image" \
+              --restart=Never \
+              --command -- sh -c "$cmd" >&2
+
+            local phase=""
+            for attempt in $(seq 1 30); do
+              phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+                break
+              fi
+              sleep 2
+            done >&2
+
+            kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null || true
+
+            kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >&2
+
+            [ "$phase" = "Succeeded" ]
+          }
+
+          # Connect to KEYCLOAK_INTERNAL_URL (the only address actually
+          # reachable from inside the cluster -- confirmed live on dev-dpn02
+          # 2026-09-17: curling the public NLB hostname directly from an
+          # in-cluster pod timed out, it is not VPC-reachable) but send
+          # ISSUER_URL's own host:port as the Host header. Keycloak (hostname
+          # v2, no KC_HOSTNAME pinned) derives every advertised URL, including
+          # `issuer`, from the Host header of whichever request asks -- so a
+          # plain internal-Host probe always gets back the internal issuer,
+          # even on releases whose keycloak.issuerUrl has deliberately been
+          # set to the public one (real end-user logins mint their token via
+          # a browser hitting the PUBLIC url, so that's the issuer that
+          # actually matters -- confirmed live the same day: a real login
+          # failed with "id token issued by a different provider, expected
+          # <internal>, got <public>" until issuerUrl was set to match
+          # publicUrl). When no override is set, ISSUER_URL already equals
+          # KEYCLOAK_INTERNAL_URL, so the Host header override is a no-op for
+          # every other environment.
+          ISSUER_HOST_PORT="$(printf '%s' "$ISSUER_URL" | sed -E 's#^https?://##')"
+
+          WELL_KNOWN="$(run_ephemeral_pod oauth2-proxy-keycloak-test curlimages/curl:8.8.0 \
+            "curl -sSk --max-time 15 -H 'Host: $ISSUER_HOST_PORT' $KEYCLOAK_INTERNAL_URL/realms/$REALM/.well-known/openid-configuration" || true)"
+
+          ADVERTISED_ISSUER="$(printf '%s' "$WELL_KNOWN" | sed -n 's/.*"issuer":"\([^"]*\)".*/\1/p')"
+
+          if [ -z "$ADVERTISED_ISSUER" ]; then
+            echo "::error::Could not read the issuer from $KEYCLOAK_INTERNAL_URL/realms/$REALM/.well-known/openid-configuration (Host: $ISSUER_HOST_PORT). Either Keycloak is not reachable from $NAMESPACE, or realm '$REALM' does not exist."
+            echo "Response was: $WELL_KNOWN"
+            exit 1
+          fi
+
+          EXPECTED_ISSUER="$ISSUER_URL/realms/$REALM"
+
+          echo "Keycloak advertises: $ADVERTISED_ISSUER"
+          echo "This release expects: $EXPECTED_ISSUER"
+
+          if [ "$ADVERTISED_ISSUER" != "$EXPECTED_ISSUER" ]; then
+            echo "::error::Keycloak's issuer ($ADVERTISED_ISSUER) does not match what this release would validate tokens against ($EXPECTED_ISSUER). If KC_HOSTNAME has been pinned on Keycloak since this was configured, set keycloak.issuerUrl in $VALUES_FILE to ${ADVERTISED_ISSUER%/realms/$REALM} and re-run."
+            exit 1
+          fi
+
+          echo "Issuer matches."
+
+      - name: Helm Lint + Dry Run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_DIR="dpn-health-monitoring/charts/oauth2-proxy"
+          VALUES_FILE="$CHART_DIR/values-$VALUES_SUFFIX.yaml"
+          ENV_VALUES_FILE="$CHART_DIR/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" -f "$ENV_VALUES_FILE"
+
+          EXTERNAL_URL_ARGS=()
+          if [ -n "${EXTERNAL_URL:-}" ]; then
+            EXTERNAL_URL_ARGS=(--set "externalUrl=$EXTERNAL_URL")
+          fi
+
+          helm template "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            -f "$ENV_VALUES_FILE" \
+            "${EXTERNAL_URL_ARGS[@]}" \
+            --debug > /tmp/oauth2-proxy-rendered.yaml
+
+          echo "Rendered resource kinds:"
+          grep "^kind:" /tmp/oauth2-proxy-rendered.yaml || true
+
+      - name: Helm Deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CHART_DIR="dpn-health-monitoring/charts/oauth2-proxy"
+          VALUES_FILE="$CHART_DIR/values-$VALUES_SUFFIX.yaml"
+          ENV_VALUES_FILE="$CHART_DIR/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+
+          # Deliberately NOT --atomic: on failure that uninstalls the whole
+          # release, destroying the pods/Services/events needed to work out
+          # why the deploy failed. A failed deploy leaves the broken resources
+          # in place instead.
+          DEPLOY_OK=true
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            EXTERNAL_URL_ARGS=()
+            if [ -n "${EXTERNAL_URL:-}" ]; then
+              EXTERNAL_URL_ARGS=(--set "externalUrl=$EXTERNAL_URL")
+            fi
+
+            # NOTE: no --wait here. Long-lived Helm watches against the EKS
+            # API from this runner are unreliable and time out even when the
+            # rollout completes successfully on the cluster — see
+            # certificate-manager-cd.yml. Poll rollout status separately.
+            if ! helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+                 --namespace "$NAMESPACE" \
+                 -f "$VALUES_FILE" \
+                 -f "$ENV_VALUES_FILE" \
+                 "${EXTERNAL_URL_ARGS[@]}"; then
+              DEPLOY_OK=false
+            fi
+
+            if [ "$DEPLOY_OK" = "true" ]; then
+              ROLLOUT_OK=false
+              for attempt in 1 2 3 4 5; do
+                if kubectl rollout status deployment/"$RELEASE_NAME" -n "$NAMESPACE" --timeout=60s; then
+                  ROLLOUT_OK=true
+                  break
+                fi
+                echo "Rollout status attempt $attempt/5 did not complete within 60s — retrying..."
+                sleep 10
+              done
+              [ "$ROLLOUT_OK" = "true" ] || DEPLOY_OK=false
+            fi
+          else
+            if ! helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+                 --namespace "$NAMESPACE" \
+                 -f "$VALUES_FILE" \
+                 -f "$ENV_VALUES_FILE" \
+                 --wait \
+                 --timeout 5m; then
+              DEPLOY_OK=false
+            fi
+          fi
+
+          if [ "$DEPLOY_OK" != "true" ]; then
+
+            echo "========================================"
+            echo "Deploy failed — diagnostics"
+            echo "========================================"
+
+            kubectl get pods -n "$NAMESPACE" -l app="$RELEASE_NAME" -o wide || true
+            kubectl describe pods -n "$NAMESPACE" -l app="$RELEASE_NAME" || true
+            kubectl logs -n "$NAMESPACE" -l app="$RELEASE_NAME" --tail=100 --all-containers || true
+            kubectl logs -n "$NAMESPACE" -l app="$RELEASE_NAME" --tail=100 --all-containers --previous || true
+            kubectl describe svc "$RELEASE_NAME" -n "$NAMESPACE" || true
+            kubectl get events -n "$NAMESPACE" --sort-by=.metadata.creationTimestamp | tail -40 || true
+
+            exit 1
+          fi
+
+          if [ "${{ inputs.cloud }}" != "aws" ]; then
+            kubectl rollout status deployment/"$RELEASE_NAME" -n "$NAMESPACE" --timeout=300s
+          fi
+
+      - name: Post-Deploy Verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get svc "$RELEASE_NAME" -n "$NAMESPACE"
+          kubectl get pods -n "$NAMESPACE" -l app="$RELEASE_NAME"
+
+          LB_IP="$(kubectl get svc "$RELEASE_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+          echo "oauth2-proxy internal LB IP: ${LB_IP:-<pending>}"
+
+          # Same runner-connectivity caveat as the Keycloak issuer check above
+          # (kubectl run --attach is unreliable here) — redefined in this step
+          # since functions don't persist across separate workflow steps.
+          run_ephemeral_pod() {
+            local pod_name="$1"
+            local image="$2"
+            local cmd="$3"
+
+            kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s >&2
+
+            kubectl run "$pod_name" -n "$NAMESPACE" \
+              --image="$image" \
+              --restart=Never \
+              --command -- sh -c "$cmd" >&2
+
+            local phase=""
+            for attempt in $(seq 1 30); do
+              phase=$(kubectl get pod "$pod_name" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              if [ "$phase" = "Succeeded" ] || [ "$phase" = "Failed" ]; then
+                break
+              fi
+              sleep 2
+            done >&2
+
+            kubectl logs "$pod_name" -n "$NAMESPACE" 2>/dev/null || true
+
+            kubectl delete pod "$pod_name" -n "$NAMESPACE" --ignore-not-found --wait=false >&2
+
+            [ "$phase" = "Succeeded" ]
+          }
+
+          # Both requests go to the TLS listener, which is the only one
+          # oauth2-proxy binds at all. -k because the serving certificate is
+          # issued for the browser-facing address, not the Service name.
+          #   /ping  -> 200, the unauthenticated health endpoint
+          #   /      -> 302, an unauthenticated request must be bounced to
+          #             Keycloak and must never return the UI
+          run_ephemeral_pod oauth2-proxy-curl-test curlimages/curl:8.8.0 \
+            "echo -n 'ping (expect 200): '; curl -sSk -o /dev/null -w '%{http_code}\n' --max-time 10 https://$RELEASE_NAME:${SERVICE_PORT}/ping || true; \
+             echo -n 'root (expect 302): '; curl -sSk -o /dev/null -w '%{http_code}\n' --max-time 10 https://$RELEASE_NAME:${SERVICE_PORT}/ || true" || true
+
+          echo "oauth2-proxy ($RELEASE_NAME) deployment completed."

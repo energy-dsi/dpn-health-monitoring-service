@@ -1,0 +1,44 @@
+# =============================================================================
+# Perses — AWS dev-dpn01 values
+# EKS     : <<your specific value>>
+# Account : <<your specific value>>
+# Region  : eu-west-2
+#
+# Content mirrors ../test-dpn01.yaml — this chart has no cloud-specific or
+# account-specific template logic (imagePullSecret and storageClassName are
+# already parameterized), so only the account/cluster identifiers above
+# differ from test-dpn01.
+# =============================================================================
+
+namespace: ns-dpn-health-01
+
+imagePullSecret: ghcr-pull-secret
+
+image:
+  repository: <<your specific value>>/perses
+  tag: v0.53.1
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  name: dpn-perses-health
+  type: ClusterIP
+  port: 8083
+  targetPort: 8080
+  annotations: {}
+
+persistence:
+  enabled: true
+  name: dpn-perses-data
+  size: 8Gi
+  storageClassName: gp3
+  mountPath: /data
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

@@ -1,0 +1,177 @@
+# =============================================================================
+# Kafka Stack — AWS dev-dpn01 values
+# EKS     : <<your specific value>>
+# Account : <<your specific value>>
+# Region  : eu-west-2
+#
+# Content mirrors ../test-dpn01.yaml — this chart has no cloud-specific or
+# account-specific template logic (imagePullSecret and storageClass are
+# already parameterized), so only the account/cluster identifiers above
+# differ from test-dpn01. Checked ../azure/dev-dpn01.yaml and
+# ../azure/dev-dpn02.yaml against ../azure/test-dpn01.yaml /
+# ../azure/test-dpn02.yaml for genuine dev-vs-test overrides (per task):
+# the only divergence found is that both azure dev files (and azure
+# test-dpn02) still expose kafkaUi as ClusterIP with no TLS, while azure
+# test-dpn01 and this chart's AWS test-dpn01/test-dpn02 already use the
+# newer LoadBalancer+TLS-terminated pattern described in
+# charts/oauth2-proxy/README.md. Since even an azure *test* cluster
+# (test-dpn02) is still on the old ClusterIP form, this reads as a
+# migration-order artifact (test-dpn01 got the new pattern first) rather
+# than a deliberate dev-only policy, so this file follows the AWS test
+# pattern (LoadBalancer+TLS) rather than azure-dev's older form. Flagging
+# this judgment call for human confirmation before dev deploy.
+# =============================================================================
+
+namespace: ns-dpn-health-01
+
+imagePullSecret: ghcr-pull-secret
+
+zookeeper:
+  name: dpn-zookeeper-health
+  replicaCount: 1
+
+  image:
+    repository: <<your specific value>>/dpn-zookeeper
+    tag: "7.5.3"
+    pullPolicy: Always
+
+  service:
+    name: dpn-zookeeper-health
+    port: 2181
+
+  env:
+    ZOOKEEPER_CLIENT_PORT: "2181"
+    ZOOKEEPER_SERVER_ID: "1"
+    ZOOKEEPER_SERVERS: "dpn-zookeeper-health:2888:3888"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: true
+    storageClass: gp3
+    size: 16Gi
+    fsGroup: 1001
+
+  # This image's Python 3.9 startup tooling imports boto3 -> botocore ->
+  # urllib3; the cluster's ADOT Python auto-instrumentation webhook injects
+  # a urllib3 build compiled against Python 3.10+ union syntax, which
+  # crashes the pod on import (confirmed with infra on test-dpn01,
+  # 2026-09-07 — same webhook/image estate applies to this cluster).
+  # Zookeeper doesn't need Python APM instrumentation.
+  #
+  # Also disabling java/nodejs/dotnet injection: on test-dpn01 the
+  # Deployment repeatedly got stuck at Init:0/3 with those three ADOT init
+  # containers wedged at PodInitializing (never erroring, never
+  # progressing) until the rollout exceeded its progress deadline —
+  # confirmed 2026-09-10 across multiple rollouts, not a one-off bad node.
+  # Carried over here as the same precaution. Zookeeper needs none of
+  # these either.
+  podAnnotations:
+    instrumentation.opentelemetry.io/inject-python: "false"
+    instrumentation.opentelemetry.io/inject-java: "false"
+    instrumentation.opentelemetry.io/inject-nodejs: "false"
+    instrumentation.opentelemetry.io/inject-dotnet: "false"
+
+kafka:
+  enabled: true
+  name: dpn-kafka-health
+  replicaCount: 1
+
+  image:
+    repository: <<your specific value>>/dpn-kafka
+    tag: "7.5.3"
+    pullPolicy: Always
+
+  service:
+    name: dpn-kafka-health
+    type: ClusterIP
+    port: 9092
+    internalPort: 9093
+
+  env:
+    KAFKA_BROKER_ID: "1"
+    KAFKA_ZOOKEEPER_CONNECT: "dpn-zookeeper-health:2181"
+    KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9093,INTERNAL_FQDN://0.0.0.0:9092"
+    KAFKA_ADVERTISED_LISTENERS: "INTERNAL://dpn-kafka-health:9093,INTERNAL_FQDN://dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092"
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,INTERNAL_FQDN:PLAINTEXT"
+    KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    KAFKA_MESSAGE_MAX_BYTES: "10485760"
+    KAFKA_REPLICA_FETCH_MAX_BYTES: "10485760"
+    KAFKA_LOG_DIRS: "/tmp/kafka-data/data"
+    KAFKA_DATA_DIRS: "/tmp/kafka-data"
+    KAFKA_LOG_RETENTION_HOURS: "4320"          # 180 days
+    KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "300000"  # default 5 min
+    KAFKA_LOG_SEGMENT_BYTES: "1073741824"      # 1GB segments (default)
+    KAFKA_LOG_CLEANUP_POLICY: "delete"         # explicit
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1500m
+      memory: 2Gi
+
+  persistence:
+    enabled: true
+    storageClass: gp3
+    size: 256Gi
+
+  securityContext:
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+
+  # See zookeeper.podAnnotations above for why all four are disabled.
+  podAnnotations:
+    instrumentation.opentelemetry.io/inject-python: "false"
+    instrumentation.opentelemetry.io/inject-java: "false"
+    instrumentation.opentelemetry.io/inject-nodejs: "false"
+    instrumentation.opentelemetry.io/inject-dotnet: "false"
+
+kafkaUi:
+  enabled: true
+  name: dpn-kafka-health-ui
+  replicaCount: 1
+
+  image:
+    repository: <<your specific value>>/kafka-ui
+    tag: v0.7.2
+    pullPolicy: IfNotPresent
+
+  # Exposed directly on an internal NLB now that Kafka UI uses its own native
+  # OIDC login instead of sitting behind oauth2-proxy (see
+  # charts/oauth2-proxy/README.md — oauth2-proxy-kafka-ui has been retired).
+  # oidcRbac is NOT enabled below, matching this chart's test-dpn01/test-dpn02
+  # pattern — so this is TLS-terminated but has no login in front of it at
+  # all. Deliberate match to the test pattern, not an oversight.
+  service:
+    type: LoadBalancer
+    port: 8082
+    targetPort: 8080
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+      service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+
+  # Kafka UI now terminates its own browser-facing TLS (no oauth2-proxy in
+  # front of it anymore) — reuses the same dpn-health-tls Secret every other
+  # UI in this namespace already uses.
+  tls:
+    enabled: true
+    secretName: dpn-health-tls
+
+  env:
+    KAFKA_CLUSTERS_0_NAME: "dpn-kafka-health"
+    KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092"
+    KAFKA_CLUSTERS_0_ZOOKEEPER: "dpn-zookeeper-health.ns-dpn-health-01.svc.cluster.local:2181"
+    DYNAMIC_CONFIG_ENABLED: "true"

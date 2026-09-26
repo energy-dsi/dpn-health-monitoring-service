@@ -1,0 +1,152 @@
+namespace: ns-dpn-health-01
+
+zookeeper:
+  name: dpn-zookeeper-health
+  replicaCount: 1
+
+  image:
+    repository: <<CONTAINER_REGISTRY_URL>>/dpn-zookeeper
+    tag: "7.5.3"
+    pullPolicy: Always
+
+  service:
+    name: dpn-zookeeper-health
+    port: 2181
+
+  env:
+    ZOOKEEPER_CLIENT_PORT: "2181"
+    ZOOKEEPER_SERVER_ID: "1"
+    ZOOKEEPER_SERVERS: "dpn-zookeeper-health:2888:3888"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Persist Zookeeper data so a pod reschedule / node upgrade does NOT wipe the
+  # cluster metadata (which previously caused Kafka's InconsistentClusterIdException).
+  persistence:
+    enabled: true
+    storageClass: managed-premium
+    size: 16Gi
+    fsGroup: 1001
+
+kafka:
+  enabled: true
+  name: dpn-kafka-health
+  replicaCount: 1
+
+  image:
+    repository: <<CONTAINER_REGISTRY_URL>>/dpn-kafka
+    tag: "7.5.3"
+    pullPolicy: Always
+
+  service:
+    name: dpn-kafka-health
+    type: ClusterIP
+    port: 9092
+    # Inter-broker (INTERNAL) listener port, advertised as dpn-kafka-health:9093.
+    # Must match the 9093 in KAFKA_LISTENERS / KAFKA_ADVERTISED_LISTENERS below.
+    internalPort: 9093
+
+  env:
+    KAFKA_BROKER_ID: "1"
+    KAFKA_ZOOKEEPER_CONNECT: "dpn-zookeeper-health:2181"
+    KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9093,INTERNAL_FQDN://0.0.0.0:9092"
+    KAFKA_ADVERTISED_LISTENERS: "INTERNAL://dpn-kafka-health:9093,INTERNAL_FQDN://dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092"
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,INTERNAL_FQDN:PLAINTEXT"
+    KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    KAFKA_MESSAGE_MAX_BYTES: "10485760"
+    KAFKA_REPLICA_FETCH_MAX_BYTES: "10485760"
+#    KAFKA_LOG_DIRS: "/tmp/kafka-data"
+    KAFKA_LOG_DIRS: "/tmp/kafka-data/data"
+    KAFKA_DATA_DIRS: "/tmp/kafka-data"
+    KAFKA_LOG_RETENTION_HOURS: "4320"          # 180 days
+    KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "300000"  # default 5 min
+    KAFKA_LOG_SEGMENT_BYTES: "1073741824"      # 1GB segments (default)
+    KAFKA_LOG_CLEANUP_POLICY: "delete"         # explicit
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1500m
+      memory: 2Gi
+
+  persistence:
+    enabled: true
+    storageClass: managed-premium
+    size: 256Gi
+
+  securityContext:
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+
+kafkaUi:
+  enabled: true
+  name: dpn-kafka-health-ui
+  replicaCount: 1
+
+  image:
+    repository: provectuslabs/kafka-ui
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  service:
+    # Exposed directly on the namespace's shared internal LoadBalancer
+    # address now that Kafka UI uses its own native OIDC login instead of
+    # sitting behind oauth2-proxy — see charts/oauth2-proxy/README.md.
+    type: LoadBalancer
+    port: 8082
+    targetPort: 8080
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    loadBalancerIP: <<your specific value>>
+
+  # Kafka UI now terminates its own browser-facing TLS (no oauth2-proxy in
+  # front of it anymore) — reuses the same dpn-health-tls Secret every
+  # other UI in this namespace already uses.
+  tls:
+    enabled: true
+    secretName: dpn-health-tls
+
+  env:
+    KAFKA_CLUSTERS_0_NAME: "dpn-kafka-health"
+    KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092"
+    KAFKA_CLUSTERS_0_ZOOKEEPER: "dpn-zookeeper-health.ns-dpn-health-01.svc.cluster.local:2181"
+    DYNAMIC_CONFIG_ENABLED: "true"
+    # Was unset (defaults to DISABLED) — browser login + RBAC now come from
+    # the mounted oauth2-rbac.yml (SPRING_CONFIG_ADDITIONAL_LOCATION below),
+    # which sets auth.type: OAUTH2. This env var takes precedence over that
+    # file in Spring's property resolution order, so it must say the same
+    # thing or the file's setting would be silently overridden.
+    AUTH_TYPE: "OAUTH2"
+
+  # Browser-facing OIDC login + role-based access control (dpnadmin = full
+  # CRUD, dpnreader = view-only), consuming the same dpn-service-client
+  # roles/groups set up in dpn-authentication-service's
+  # charts/keycloak/scripts/configure-keycloak.sh. See
+  # templates/kafka-ui-oidc-rbac-configmap.yaml for what this feeds.
+  oidcRbac:
+    enabled: true
+    clientId: dpn-service-client
+    # Must exactly match the redirect URI registered on dpn-service-client.
+    browserHost: "dpn-observability.ns-dpn-health-01.svc.cluster.local:8082"
+    keycloakBaseUrl: "https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443"
+    keycloakRealm: "dpn-realm"
+    # Same Key Vault this cluster already uses everywhere else (see
+    # charts/oauth2-proxy/values.yaml's akv block) — used by
+    # templates/kafka-ui-oidc-rbac-secretproviderclass.yaml.
+    akv:
+      keyvaultName: <<your specific value>>
+      tenantId: <<your specific value>>
+      userAssignedIdentityID: <<your specific value>>

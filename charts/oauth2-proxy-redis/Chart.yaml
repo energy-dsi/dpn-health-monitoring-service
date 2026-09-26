@@ -1,0 +1,6 @@
+apiVersion: v2
+name: oauth2-proxy-redis
+description: Shared Redis session store for the DPN observability oauth2-proxy gateways
+type: application
+version: 0.1.0
+appVersion: "7"

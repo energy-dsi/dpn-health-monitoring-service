@@ -1,0 +1,6 @@
+type: AZURE
+config:
+  storage_account: "<<your specific value>>"
+  container: "thanos-metrics"
+  storage_connection_string: "BlobEndpoint=<<your specific value>>/;SharedAccessSignature=SAS-Token"
+  max_retries: 3

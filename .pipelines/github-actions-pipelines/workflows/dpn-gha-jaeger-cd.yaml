@@ -1,0 +1,292 @@
+name: DPN CD - Jaeger
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      cluster:
+        required: true
+        type: string
+      cloud:
+        required: true
+        type: string
+      ACR_NAME:
+        required: true
+        type: string
+      BASE_REGISTRY:
+        required: true
+        type: string
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      RESOURCE_GROUP:
+        required: true
+        type: string
+      AKS_CLUSTER:
+        required: true
+        type: string
+      KEY_VAULT_NAME:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      AWS_REGION:
+        required: false
+        type: string
+      AWS_ACCOUNT_ID:
+        required: false
+        type: string
+      EKS_CLUSTER:
+        required: false
+        type: string
+      imageTag:
+        required: false
+        type: string
+        default: ""
+      collectorImageRepository:
+        required: false
+        type: string
+        default: ""
+      queryImageRepository:
+        required: false
+        type: string
+        default: ""
+      ingesterImageRepository:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Jaeger
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Export Config as Env Vars
+        shell: bash
+        run: |
+          echo "ACR_NAME=${{ inputs.ACR_NAME }}" >> "$GITHUB_ENV"
+          echo "BASE_REGISTRY=${{ inputs.BASE_REGISTRY }}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "RESOURCE_GROUP=${{ inputs.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER=${{ inputs.AKS_CLUSTER }}" >> "$GITHUB_ENV"
+          echo "KEY_VAULT_NAME=${{ inputs.KEY_VAULT_NAME }}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${{ inputs.NAMESPACE }}" >> "$GITHUB_ENV"
+          echo "ARM_SUBSCRIPTION_ID=${{ inputs.ARM_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ inputs.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=${{ inputs.AWS_ACCOUNT_ID }}" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER=${{ inputs.EKS_CLUSTER }}" >> "$GITHUB_ENV"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Verify Cluster Access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm ls -n "$NAMESPACE"
+          kubectl get all -n "$NAMESPACE"
+
+      - name: Deploy Jaeger
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_NAME="dpn-jaeger"
+          CHART_DIR="dpn-health-monitoring/charts/jaeger"
+          VALUES_FILE="$CHART_DIR/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+
+          echo "CHART_DIR=$CHART_DIR"
+          echo "VALUES_FILE=$VALUES_FILE"
+
+          if [ ! -d "$CHART_DIR" ]; then
+            echo "Jaeger chart directory missing: $CHART_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$CHART_DIR/Chart.yaml" ]; then
+            echo "Jaeger Chart.yaml missing: $CHART_DIR/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -d "$CHART_DIR/templates" ]; then
+            echo "Jaeger templates directory missing: $CHART_DIR/templates"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Jaeger values file missing: $VALUES_FILE"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Checking Jaeger dependencies..."
+          echo "========================================"
+
+          echo "Checking Kafka service..."
+          kubectl get svc dpn-kafka-health -n "$NAMESPACE"
+
+          echo "Checking Kafka endpoints..."
+
+          KAFKA_PORTS=$(kubectl get endpoints dpn-kafka-health \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.subsets[*].ports[*].port}')
+
+          echo "Kafka endpoint ports: $KAFKA_PORTS"
+
+          if ! echo "$KAFKA_PORTS" | grep -wq "9092"; then
+            echo "Kafka endpoint dpn-kafka-health does not have ready backend on port 9092"
+
+            kubectl get endpoints dpn-kafka-health \
+              -n "$NAMESPACE" \
+              -o yaml || true
+
+            exit 1
+          fi
+
+          echo "Kafka endpoint validation passed."
+
+          echo "Checking OpenSearch service..."
+          kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+
+          echo "Checking OpenSearch endpoints..."
+          if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" | grep -q ":9200"; then
+            echo "OpenSearch endpoint dpn-opensearch-health does not have ready backend on port 9200"
+            kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" || true
+            exit 1
+          fi
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.imageTag }}" ]; then
+            EXTRA_ARGS+=(--set image.tag="${{ inputs.imageTag }}")
+          fi
+          if [ -n "${{ inputs.collectorImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set collector.image.repository="<<your specific value>>/${{ inputs.collectorImageRepository }}")
+          fi
+          if [ -n "${{ inputs.queryImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set query.image.repository="<<your specific value>>/${{ inputs.queryImageRepository }}")
+          fi
+          if [ -n "${{ inputs.ingesterImageRepository }}" ]; then
+            EXTRA_ARGS+=(--set ingester.image.repository="<<your specific value>>/${{ inputs.ingesterImageRepository }}")
+          fi
+
+          echo "========================================"
+          echo "Linting Jaeger chart..."
+          echo "========================================"
+
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" "${EXTRA_ARGS[@]}"
+
+          echo "========================================"
+          echo "Rendering Jaeger chart..."
+          echo "========================================"
+
+          helm template "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            "${EXTRA_ARGS[@]}" \
+            --debug > /tmp/jaeger-rendered.yaml
+
+          echo "========================================"
+          echo "Deploying Jaeger custom chart..."
+          echo "========================================"
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            # NOTE: no --wait here. Long-lived Helm watches against the EKS
+            # API from this runner are unreliable and time out even when the
+            # rollout completes successfully on the cluster — see
+            # certificate-manager-cd.yml. Poll rollout status separately below.
+            helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --debug
+          else
+            helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --wait \
+              --timeout 10m \
+              --debug
+          fi
+
+          echo "========================================"
+          echo "Jaeger rollout status..."
+          echo "========================================"
+
+          wait_for_rollout() {
+            DEPLOYMENT="$1"
+            if [ "${{ inputs.cloud }}" = "aws" ]; then
+              ROLLOUT_OK=false
+              for attempt in 1 2 3 4 5; do
+                if kubectl rollout status deployment/"$DEPLOYMENT" -n "$NAMESPACE" --timeout=60s; then
+                  ROLLOUT_OK=true
+                  break
+                fi
+                echo "Rollout status attempt $attempt/5 for $DEPLOYMENT did not complete within 60s — retrying..."
+                sleep 10
+              done
+              if [ "$ROLLOUT_OK" != "true" ]; then
+                echo "::error::Deployment $DEPLOYMENT did not report ready after 5 attempts."
+                exit 1
+              fi
+            else
+              kubectl rollout status deployment/"$DEPLOYMENT" -n "$NAMESPACE" --timeout=300s
+            fi
+          }
+
+          wait_for_rollout dpn-jaeger-ingester-health
+          wait_for_rollout dpn-jaeger-query-health
+
+          echo "========================================"
+          echo "Jaeger endpoints:"
+          echo "========================================"
+
+          kubectl get endpoints -n "$NAMESPACE" | grep jaeger || true
+
+          echo "========================================"
+          echo "Jaeger logs:"
+          echo "========================================"
+
+          kubectl logs -n "$NAMESPACE" \
+            -l app.kubernetes.io/name=jaeger \
+            --tail=150 || true
+
+          echo "========================================"
+          echo "Testing Jaeger Query UI service..."
+          echo "========================================"
+
+          if kubectl get svc dpn-jaeger-query-health -n "$NAMESPACE" >/dev/null 2>&1; then
+            kubectl run jaeger-curl-test \
+              -n "$NAMESPACE" \
+              --image=curlimages/curl:8.8.0 \
+              --restart=Never \
+              --rm \
+              --attach \
+              --command -- sh -c "curl -i --max-time 10 http://dpn-jaeger-query-health:16686 || true"
+          else
+            echo "Service dpn-jaeger-query-health not found. Skipping curl test."
+          fi
+
+          echo "Jaeger deployment completed."

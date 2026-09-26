@@ -1,0 +1,14 @@
+fastapi==0.141.1
+# Pinned explicitly (fastapi's own constraint is only "starlette>=0.46.0",
+# no upper bound) to force resolution past starlette 0.46.2, which carries
+# several CVEs fixed only in 1.x (SSRF via UNC path in StaticFiles, ReDoS in
+# FileResponse Range parsing, among others) -- see the Checkmarx SCA report.
+starlette==1.6.0
+# Plain uvicorn (no [standard]) intentionally: the [standard] extra pulls
+# uvloop, which has no musllinux (Alpine) wheel and would force a source
+# build or break the build outright. It also drops httptools/websockets,
+# which this app doesn't use, reducing the C-extension attack surface. Same
+# choice dpn-file-scan-service's Dockerfile makes for the same reason (see
+# its requirements.txt).
+uvicorn==0.30.1
+jinja2==3.1.6

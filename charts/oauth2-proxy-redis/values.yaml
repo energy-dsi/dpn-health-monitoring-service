@@ -1,0 +1,46 @@
+# ===========================================================================
+# oauth2-proxy-redis — one shared session store for every oauth2-proxy
+# release in ns-dpn-health-01.
+#
+# Why this is a SEPARATE release rather than something one of the eight (soon
+# nine) oauth2-proxy releases owns: the client-secret Secret was owned by one
+# release earlier in this project and was destroyed the first time that
+# release rolled back, taking every OTHER release's credential with it (see
+# charts/oauth2-proxy/README.md). Session storage that all nine proxies depend
+# on must not be tied to any single one of their lifecycles either — deleting
+# or upgrading dpn-oauth2-proxy-osd must never take down sessions for the
+# other eight.
+#
+# Why Redis at all: without it, oauth2-proxy stores the full Keycloak token
+# bundle (id_token + access_token + refresh_token) in the browser cookie.
+# This realm's tokens carry the audience and roles claims described in the
+# oauth2-proxy chart, and a cookie built from them can exceed common proxy/
+# browser header-size limits, surfacing as HTTP 431 "Request Header Too
+# Large" — the same failure mode the docker-compose stack's own redis service
+# exists to avoid (see config/docker-compose.observability-full.yml). Redis
+# moves the token bundle server-side; the browser cookie shrinks to a session
+# ID of a few dozen bytes.
+#
+# No persistence is configured, matching the docker-compose redis service.
+# A restart invalidates every active session — everyone is asked to log in
+# again — which is judged an acceptable trade against running a stateful
+# workload for what is disposable session cache.
+# ===========================================================================
+
+name: dpn-redis-ui-health
+namespace: ns-dpn-health-01
+
+image:
+  repository: redis
+  tag: "7-alpine"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi

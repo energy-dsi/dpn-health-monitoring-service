@@ -1,0 +1,96 @@
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+# Which UI this proxy fronts. One Helm release per UI, each with its own
+# values file, all sharing one Keycloak client and one Key Vault secret
+# (KC-SERVICE-CLIENT-SECRET), synced in via its own SecretProviderClass.
+# These replace the nginx basic-auth proxy entirely; portal is new
+# — it has no nginx or prior cluster history, it only existed in
+# docker-compose before now (see charts/oauth2-proxy/values-portal.yaml).
+# prometheus/thanos/airflow/kafka-ui/kafka-ui-2 have no gateway here — see
+# charts/oauth2-proxy/README.md.
+- name: component
+  displayName: 'UI behind the proxy'
+  type: string
+  default: opensearch
+  values:
+    - opensearch
+    - jaeger
+    - perses
+    - portal
+
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+# Name of a job this one must wait for. The master pipeline chains all eight
+# components through this so they deploy one after another: every release
+# claims a port on the SAME static LoadBalancer address, and Azure reconciles
+# that address badly when several Services mutate it at once.
+- name: dependsOnJob
+  displayName: 'Wait for this job first (blank = none)'
+  type: string
+  default: ''
+
+jobs:
+# Unique per component, since the master instantiates this template nine times
+# in one stage. Hyphens are not legal in a job name, hence the replace().
+- job: DeployOAuth2Proxy_${{ replace(parameters.component, '-', '_') }}
+  displayName: Deploy oauth2-proxy (${{ parameters.component }})
+  ${{ if ne(parameters.dependsOnJob, '') }}:
+    dependsOn: ${{ parameters.dependsOnJob }}
+
+  steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Deploy oauth2-proxy
+    # No secret variables are mapped in, because this pipeline never
+    # handles the Keycloak client credential. The Secret holding it is
+    # created by hand once per namespace and read directly by the pod
+    # through secretKeyRef, so the deploy only checks that it exists.
+    inputs:
+      azureSubscription: ${{ parameters.ServiceConnection }}
+      scriptType: bash
+      # scriptPath, not inlineScript. Azure DevOps evaluates a block
+      # scalar containing ${{ }} expressions as a SINGLE template
+      # expression and caps it at 21000 characters — this deploy script
+      # is well past that, and grew past it the moment all eight
+      # components got their own case branch. Keeping it in a real file
+      # also means shellcheck can read it and it can be run by hand.
+      scriptLocation: scriptPath
+      scriptPath: $(Build.SourcesDirectory)/.pipelines/azure-pipelines/scripts/deploy-oauth2-proxy.sh
+      arguments: '${{ parameters.environment }} ${{ parameters.cluster }} ${{ parameters.component }} $(Build.SourcesDirectory)'

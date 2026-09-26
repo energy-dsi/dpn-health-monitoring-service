@@ -1,0 +1,270 @@
+name: DPN CD - Data Prepper
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      cluster:
+        required: true
+        type: string
+      cloud:
+        required: true
+        type: string
+      ACR_NAME:
+        required: true
+        type: string
+      BASE_REGISTRY:
+        required: true
+        type: string
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      RESOURCE_GROUP:
+        required: true
+        type: string
+      AKS_CLUSTER:
+        required: true
+        type: string
+      KEY_VAULT_NAME:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      AWS_REGION:
+        required: false
+        type: string
+      AWS_ACCOUNT_ID:
+        required: false
+        type: string
+      EKS_CLUSTER:
+        required: false
+        type: string
+      imageRepository:
+        required: false
+        type: string
+        default: ""
+      imageTag:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Data Prepper
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Export Config as Env Vars
+        shell: bash
+        run: |
+          echo "ACR_NAME=${{ inputs.ACR_NAME }}" >> "$GITHUB_ENV"
+          echo "BASE_REGISTRY=${{ inputs.BASE_REGISTRY }}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "RESOURCE_GROUP=${{ inputs.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER=${{ inputs.AKS_CLUSTER }}" >> "$GITHUB_ENV"
+          echo "KEY_VAULT_NAME=${{ inputs.KEY_VAULT_NAME }}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${{ inputs.NAMESPACE }}" >> "$GITHUB_ENV"
+          echo "ARM_SUBSCRIPTION_ID=${{ inputs.ARM_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ inputs.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=${{ inputs.AWS_ACCOUNT_ID }}" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER=${{ inputs.EKS_CLUSTER }}" >> "$GITHUB_ENV"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Verify Cluster Access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm ls -n "$NAMESPACE"
+          kubectl get all -n "$NAMESPACE"
+
+      - name: Deploy Data Prepper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_NAME="dpn-data-prepper"
+          CHART_DIR="dpn-health-monitoring/charts/data-prepper"
+          VALUES_FILE="$CHART_DIR/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+
+          echo "CHART_DIR=$CHART_DIR"
+          echo "VALUES_FILE=$VALUES_FILE"
+
+          if [ ! -d "$CHART_DIR" ]; then
+            echo "Data Prepper chart directory missing: $CHART_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$CHART_DIR/Chart.yaml" ]; then
+            echo "Data Prepper Chart.yaml missing: $CHART_DIR/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -d "$CHART_DIR/templates" ]; then
+            echo "Data Prepper templates directory missing: $CHART_DIR/templates"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Data Prepper values file missing: $VALUES_FILE"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Checking Data Prepper dependencies..."
+          echo "========================================"
+
+          echo "Checking Kafka service..."
+          kubectl get svc dpn-kafka-health -n "$NAMESPACE"
+
+          echo "Checking Kafka endpoints..."
+          if ! kubectl get endpoints dpn-kafka-health -n "$NAMESPACE" | grep -q ":9092"; then
+            echo "Kafka endpoint dpn-kafka-health does not have ready backend on port 9092"
+            kubectl get endpoints dpn-kafka-health -n "$NAMESPACE" || true
+            exit 1
+          fi
+
+          echo "Checking OpenSearch service..."
+          kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+
+          echo "Checking OpenSearch endpoints..."
+          if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" | grep -q ":9200"; then
+            echo "OpenSearch endpoint dpn-opensearch-health does not have ready backend on port 9200"
+            kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" || true
+            exit 1
+          fi
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.imageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.imageRepository }}")
+          fi
+          if [ -n "${{ inputs.imageTag }}" ]; then
+            EXTRA_ARGS+=(--set image.tag="${{ inputs.imageTag }}")
+          fi
+
+          echo "========================================"
+          echo "Linting Data Prepper chart..."
+          echo "========================================"
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" "${EXTRA_ARGS[@]}"
+
+          echo "========================================"
+          echo "Rendering Data Prepper chart..."
+          echo "========================================"
+          helm template "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            "${EXTRA_ARGS[@]}" \
+            --debug > /tmp/data-prepper-rendered.yaml
+
+          echo "Rendered resource kinds:"
+          grep "^kind:" /tmp/data-prepper-rendered.yaml || true
+
+          echo "Checking rendered names..."
+          grep -n "name: dpn-data-prepper-health" /tmp/data-prepper-rendered.yaml || true
+
+          echo "Checking Kafka broker reference..."
+          grep -n "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092" /tmp/data-prepper-rendered.yaml || true
+
+          echo "Checking OpenSearch reference..."
+          grep -n "dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200" /tmp/data-prepper-rendered.yaml || true
+
+          echo "========================================"
+          echo "Deploying Data Prepper..."
+          echo "========================================"
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            # NOTE: no --wait here. Long-lived Helm watches against the EKS
+            # API from this runner are unreliable and time out even when the
+            # rollout completes successfully on the cluster — see
+            # certificate-manager-cd.yml. Poll rollout status separately below.
+            helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --debug
+          else
+            helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --wait \
+              --timeout 10m \
+              --debug
+          fi
+
+          echo "========================================"
+          echo "Rolling out Data Prepper..."
+          echo "========================================"
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            ROLLOUT_OK=false
+            for attempt in 1 2 3 4 5; do
+              if kubectl rollout status deployment/dpn-data-prepper-health -n "$NAMESPACE" --timeout=60s; then
+                ROLLOUT_OK=true
+                break
+              fi
+              echo "Rollout status attempt $attempt/5 did not complete within 60s — retrying..."
+              sleep 10
+            done
+            if [ "$ROLLOUT_OK" != "true" ]; then
+              echo "::error::Deployment dpn-data-prepper-health did not report ready after 5 attempts."
+              exit 1
+            fi
+          else
+            kubectl rollout status deployment/dpn-data-prepper-health \
+              -n "$NAMESPACE" \
+              --timeout=300s
+          fi
+
+          echo "========================================"
+          echo "Data Prepper resources:"
+          echo "========================================"
+
+          kubectl get pods -n "$NAMESPACE" | grep data-prepper || true
+          kubectl get svc -n "$NAMESPACE" | grep data-prepper || true
+          kubectl get endpoints -n "$NAMESPACE" | grep data-prepper || true
+          kubectl get deploy -n "$NAMESPACE" | grep data-prepper || true
+
+          echo "========================================"
+          echo "Data Prepper logs:"
+          echo "========================================"
+
+          kubectl logs -n "$NAMESPACE" \
+            -l app=dpn-data-prepper-health \
+            --tail=150 || true
+
+          echo "========================================"
+          echo "Testing Data Prepper service connectivity..."
+          echo "========================================"
+
+          kubectl run data-prepper-curl-test \
+            -n "$NAMESPACE" \
+            --image=curlimages/curl:8.8.0 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- sh -c "curl -i --max-time 10 http://dpn-data-prepper-health:4900 || true"
+
+          echo "Data Prepper deployment completed."

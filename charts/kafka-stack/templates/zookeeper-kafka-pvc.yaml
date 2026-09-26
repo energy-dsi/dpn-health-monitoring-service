@@ -1,0 +1,34 @@
+{{- if and .Values.kafka.enabled .Values.kafka.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.kafka.name }}-pvc
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafka.name }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.kafka.persistence.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.kafka.persistence.size }}
+{{- end }}
+{{- if and .Values.kafka.enabled (dig "persistence" "enabled" false .Values.zookeeper) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.zookeeper.name }}-pvc
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.zookeeper.name }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.zookeeper.persistence.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.zookeeper.persistence.size }}
+{{- end }}

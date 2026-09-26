@@ -1,0 +1,188 @@
+# dpn-portal — aws dev-dpn01 values.
+# image.repository/image.tag stay blank here on purpose —
+# .github/workflows/dpn-cd-portal.yml always supplies them via --set
+# (default image path: <<your specific value>>/dpn-portal).
+#
+# ===========================================================================
+# dpn-portal — the tile landing page fronted by oauth2-proxy on port 8443
+# (charts/oauth2-proxy/values-portal.yaml).
+#
+# Unlike the DNS-name pattern this file used to mirror from compose/Azure,
+# AWS has no corporate DNS resolving *.svc.cluster.local externally --
+# confirmed DNS_PROBE_FINISHED_NXDOMAIN in-browser on dev-dpn02, 2026-09-17,
+# fixed here the same way. Every browser-facing "url" below is instead the
+# real oauth2-proxy/Keycloak/vault LoadBalancer hostname for THIS cluster
+# (from `kubectl get svc -n ns-dpn-01` / `-n ns-dpn-health-01`) -- keep these
+# in sync with each other, and re-derive both if any of these LBs are ever
+# recreated (hostname changes). "probe_url" fields are untouched: those are
+# real in-cluster Service names, resolvable from this pod via kube-dns.
+# ===========================================================================
+
+namespace: ns-dpn-health-01
+name: dpn-portal
+
+imagePullSecrets:
+  - name: ghcr-pull-secret
+
+# No default here on purpose. app/dpn-portal is built from source in this
+# repo's ../app/dpn-portal (see docker-compose), and this chart cannot guess
+# which container registry / tag the team publishes it to. helm fails to
+# render rather than pulling a wrong or nonexistent image.
+image:
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# The browser-facing Keycloak address, realm, and this portal's OWN
+# browser-facing URL — used ONLY to build the logout link on the tile page.
+# app/dpn-portal's /oauth2/sign_out link needs to chain through Keycloak's
+# real end-session endpoint, since oauth2-proxy itself cannot do that with
+# skip_oidc_discovery=true (see main.py's _logout_url and
+# charts/oauth2-proxy/README.md). This chart has no other relationship to
+# charts/oauth2-proxy, so these three values are a deliberate second copy —
+# keep them in sync with keycloak.publicUrl / keycloak.realm and externalUrl
+# in charts/oauth2-proxy/values.yaml / values-portal.yaml, which describe the
+# same Keycloak and the same proxy release from that chart's side.
+keycloak:
+  publicUrl: "https://k8s-nsdpn01-dpnkeycl-fa70c09618-32c5d488b41f8a9b.elb.eu-west-2.amazonaws.com:8443"
+  realm: dpn-realm
+
+# Must equal externalUrl in charts/oauth2-proxy/values-portal.yaml exactly —
+# it is registered with Keycloak as this client's post_logout_redirect_uri,
+# which Keycloak matches the same way it matches an OAuth redirect_uri: no
+# trailing slash, no path, scheme and port both significant.
+externalUrl: "https://k8s-nsdpnhea-dpnoauth-9b7112165d-544f8340aac45344.elb.eu-west-2.amazonaws.com:8443"
+
+# ---------------------------------------------------------------------------
+# Every OTHER oauth2-proxy release's externalUrl (see
+# charts/oauth2-proxy/values-*.yaml) — every entry EXCEPT this portal's own.
+#
+# Logging out clears this proxy's own cookie and ends the Keycloak SSO
+# session, but the other eight releases each keep their own separate cookie
+# (_oauth2_proxy_jaeger, _oauth2_proxy_kafka_ui, ...) precisely so their
+# sessions don't collide with one another — so none of them notice the SSO
+# session ending until their own cookie_refresh (30m) next checks Keycloak.
+# All nine releases share one Keycloak client (dpn-service-client), and
+# Keycloak's front-channel logout can only iframe ONE registered URL per
+# client, so it cannot fan this out on its own either.
+#
+# index.html fires a /oauth2/sign_out beacon at each of these before
+# following the real Keycloak logout link, so one click here signs the user
+# out of every UI. Keep this list in sync with charts/oauth2-proxy/values-
+# *.yaml's externalUrl values whenever a release is added or removed — see
+# "Adding another UI" in charts/oauth2-proxy/README.md.
+otherUiUrls:
+  - "https://k8s-nsdpnhea-dpnoauth-36a76233b3-cb08ae5b00c96034.elb.eu-west-2.amazonaws.com:5601"    # opensearch
+  - "https://k8s-nsdpnhea-dpnkafka-c3071ac924-d2cfc81fbbfb1be9.elb.eu-west-2.amazonaws.com:8082"    # kafka-ui
+  - "https://k8s-nsdpn01-dpnkafka-89c846af84-73f8d76a6bc11c6d.elb.eu-west-2.amazonaws.com:8086"     # kafka-ui-2
+  - "https://k8s-nsdpnhea-dpnoauth-5f3bfe68e3-46bf6de9faed5b71.elb.eu-west-2.amazonaws.com:16686"   # jaeger
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:9081"   # prometheus -- TODO: dpn-prometheus-health-ui is ClusterIP-only, no LB yet
+  - "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:9091"   # thanos -- TODO: dpn-thanos-query-health is ClusterIP-only, no LB yet
+  - "https://k8s-nsdpnhea-dpnoauth-2bdb604d39-483070d936d67f69.elb.eu-west-2.amazonaws.com:8083"    # perses
+  - "http://k8s-nsdpn01-dpnairfl-c71dfe160b-48065e2a4d39d312.elb.eu-west-2.amazonaws.com"           # airflow (LB terminates plain HTTP, no path/port)
+
+# What app/dpn-portal renders as tiles, read from the TILES_CONFIG env var —
+# same shape as the TILES_CONFIG in docker-compose.observability-full.yml
+# (name/subtitle/description/icon/variant/groups/components per tile, each
+# component a {name, url} pair) — only the component urls differ, using the
+# cluster DNS names/ports from this file instead of compose's localhost ones.
+# "groups" gates a tile's visibility by Keycloak realm role, same set as
+# keycloak.allowedRoles in charts/oauth2-proxy/values.yaml; a tile with no
+# "groups" key is visible to everyone who reached the portal at all. GRPC
+# Gateway Client / Certification Vault Service have no matching service in
+# this cluster either, so their components carry no url.
+
+
+# Each component below carries both "url" (the browser-facing link, a
+# *.svc.cluster.local name that only exists in external/corporate DNS per
+# charts/oauth2-proxy/README.md's DNS section) and "probe_url" (the real
+# in-cluster Service address kube-dns can actually resolve from this pod).
+# portal/health.py probes "probe_url" and links out to "url" - without this
+# split every component always reports Unavailable, since CoreDNS returns
+# NXDOMAIN for a *.svc.cluster.local name with no matching Service rather
+# than forwarding it upstream to the DNS zone browsers use.
+tiles:
+  - name: Users & Roles
+    subtitle: ""
+    description: Manage DPN users, groups, and role assignments in Keycloak.
+    icon: users
+    variant: alt
+    groups: ["dpnadmin"]
+    components:
+      # dpn-keycloak-service-lb is a real Service name (see
+      # charts/oauth2-proxy/README.md), so this one already resolves from
+      # inside the cluster - no separate probe_url needed.
+      - name: Keycloak Console
+        url: "https://k8s-nsdpn01-dpnkeycl-fa70c09618-32c5d488b41f8a9b.elb.eu-west-2.amazonaws.com:8443/admin/master/console/"
+  - name: Data
+    subtitle: Store
+    description: Logical storage location for Data Products that are ready for sharing
+    icon: kafka
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      # Kafka UI terminates its own TLS and holds the shared LB address
+      # directly (see charts/oauth2-proxy/README.md) - dpn-kafka-health-ui
+      # is its actual Service name in this namespace.
+      - name: DPN Kafka
+        url: "https://k8s-nsdpnhea-dpnkafka-c3071ac924-d2cfc81fbbfb1be9.elb.eu-west-2.amazonaws.com:8082"
+        probe_url: "https://dpn-kafka-health-ui.ns-dpn-health-01.svc.cluster.local:8082"
+  - name: Gateway
+    subtitle: ""
+    description: Manage the secure and controlled exposure of Data Products to authorised Consumers
+    icon: gateway
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: GRPC Gateway Client
+        url: ""
+  - name: Data
+    subtitle: Pipeline
+    description: Manage your pipelines.
+    icon: airflow
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      # Airflow's own webserver Service, cross-namespace in ns-dpn-01 (see
+      # README's note that Airflow is reached via its own deployment,
+      # outside this chart's scope).
+      - name: Pipeline Orchestrator
+        url: "http://k8s-nsdpn01-dpnairfl-c71dfe160b-48065e2a4d39d312.elb.eu-west-2.amazonaws.com"
+        probe_url: "http://dpn-airflow-webserver.ns-dpn-01.svc.cluster.local:8080"
+  - name: Security
+    subtitle: Services
+    description: Provides the foundational security capabilities required to support authentication, authorisation, and policy enforcement within the DPN.
+    icon: security
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      - name: Certification Vault Service
+        url: "https://k8s-nsdpn01-dpnvault-ad0715cb45-369179d6e916ab2b.elb.eu-west-2.amazonaws.com:8200"
+        probe_url: "https://dpn-vault-https.ns-dpn-01.svc.cluster.local:8200"
+  - name: Health
+    subtitle: Monitoring Service
+    description: Supports the visibility and auditability of a Participant's compliance with DSI operational and behavioural requirement
+    icon: health
+    groups: ["dpnadmin", "dpnreader"]
+    components:
+      # Each of these fronts an oauth2-proxy release - dpn-oauth2-proxy-osd
+      # / -jaeger / -perses are the releases' real Service names (see
+      # charts/oauth2-proxy/templates/service.yaml + values-*.yaml's name:).
+      - name: Log Stack
+        url: "https://k8s-nsdpnhea-dpnoauth-36a76233b3-cb08ae5b00c96034.elb.eu-west-2.amazonaws.com:5601"
+        probe_url: "https://dpn-oauth2-proxy-osd.ns-dpn-health-01.svc.cluster.local:5601"
+      - name: Traces Stack
+        url: "https://k8s-nsdpnhea-dpnoauth-5f3bfe68e3-46bf6de9faed5b71.elb.eu-west-2.amazonaws.com:16686"
+        probe_url: "https://dpn-oauth2-proxy-jaeger.ns-dpn-health-01.svc.cluster.local:16686"
+      - name: Metrics Dashboard
+        url: "https://k8s-nsdpnhea-dpnoauth-2bdb604d39-483070d936d67f69.elb.eu-west-2.amazonaws.com:8083"
+        probe_url: "https://dpn-oauth2-proxy-perses.ns-dpn-health-01.svc.cluster.local:8083"
+      - name: Collector Stack
+        url: "https://k8s-nsdpnhea-dpnkafka-c3071ac924-d2cfc81fbbfb1be9.elb.eu-west-2.amazonaws.com:8082"
+        probe_url: "https://dpn-kafka-health-ui.ns-dpn-health-01.svc.cluster.local:8082"
+ 
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi

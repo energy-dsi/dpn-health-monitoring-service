@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+.env
+docs/SECRET_REDACTION.md
+.bob/rules-agent/AGENTS.md
+.bob/rules/basic_rules.md
+.bob/rules-ask/AGENTS.md
+.bob/rules-plan/AGENTS.md
+config/telegraf.conf
+.bob/mcp.json
+config/nginx/.htpasswd
+bob
+DPN-UI-HTTPS-KEYCLOAK-MIGRATION.md
+.claude/

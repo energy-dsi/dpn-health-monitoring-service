@@ -1,0 +1,385 @@
+name: DPN CD - Thanos
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      cluster:
+        required: true
+        type: string
+      cloud:
+        required: true
+        type: string
+      ACR_NAME:
+        required: true
+        type: string
+      BASE_REGISTRY:
+        required: true
+        type: string
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      RESOURCE_GROUP:
+        required: true
+        type: string
+      AKS_CLUSTER:
+        required: true
+        type: string
+      KEY_VAULT_NAME:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      AWS_REGION:
+        required: false
+        type: string
+      AWS_ACCOUNT_ID:
+        required: false
+        type: string
+      EKS_CLUSTER:
+        required: false
+        type: string
+      imageRepository:
+        required: false
+        type: string
+        default: ""
+      imageTag:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Thanos
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Export Config as Env Vars
+        shell: bash
+        run: |
+          echo "ACR_NAME=${{ inputs.ACR_NAME }}" >> "$GITHUB_ENV"
+          echo "BASE_REGISTRY=${{ inputs.BASE_REGISTRY }}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "RESOURCE_GROUP=${{ inputs.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER=${{ inputs.AKS_CLUSTER }}" >> "$GITHUB_ENV"
+          echo "KEY_VAULT_NAME=${{ inputs.KEY_VAULT_NAME }}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${{ inputs.NAMESPACE }}" >> "$GITHUB_ENV"
+          echo "ARM_SUBSCRIPTION_ID=${{ inputs.ARM_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ inputs.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=${{ inputs.AWS_ACCOUNT_ID }}" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER=${{ inputs.EKS_CLUSTER }}" >> "$GITHUB_ENV"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Verify Cluster Access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm ls -n "$NAMESPACE"
+          kubectl get all -n "$NAMESPACE"
+
+      - name: Deploy Thanos
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_NAME="dpn-thanos"
+          CHART_DIR="dpn-health-monitoring/charts/thanos"
+          VALUES_FILE="$CHART_DIR/values/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.yaml"
+
+          echo "CHART_DIR=$CHART_DIR"
+          echo "VALUES_FILE=$VALUES_FILE"
+          echo "RELEASE_NAME=$RELEASE_NAME"
+
+          if [ ! -d "$CHART_DIR" ]; then
+            echo "Thanos chart directory missing: $CHART_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$CHART_DIR/Chart.yaml" ]; then
+            echo "Thanos Chart.yaml missing: $CHART_DIR/Chart.yaml"
+            exit 1
+          fi
+
+          if [ ! -d "$CHART_DIR/templates" ]; then
+            echo "Thanos templates directory missing: $CHART_DIR/templates"
+            exit 1
+          fi
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Thanos values file missing: $VALUES_FILE"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Checking Thanos dependency: Prometheus discovery service"
+          echo "========================================"
+
+          kubectl get svc dpn-prometheus-kube-promet-thanos-discovery \
+            -n "$NAMESPACE"
+
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.imageRepository }}" ]; then
+            EXTRA_ARGS+=(--set image.repository="<<your specific value>>/${{ inputs.imageRepository }}")
+          fi
+          if [ -n "${{ inputs.imageTag }}" ]; then
+            EXTRA_ARGS+=(--set image.tag="${{ inputs.imageTag }}")
+          fi
+
+          echo "========================================"
+          echo "Linting Thanos chart"
+          echo "========================================"
+
+          helm lint "$CHART_DIR" -f "$VALUES_FILE" "${EXTRA_ARGS[@]}"
+
+          echo "========================================"
+          echo "Rendering Thanos chart"
+          echo "========================================"
+
+          helm template "$RELEASE_NAME" "$CHART_DIR" \
+            --namespace "$NAMESPACE" \
+            -f "$VALUES_FILE" \
+            "${EXTRA_ARGS[@]}" \
+            --debug > /tmp/thanos-rendered.yaml
+
+          echo "Rendered Thanos resource kinds:"
+          grep "^kind:" /tmp/thanos-rendered.yaml || true
+
+          echo "========================================"
+          echo "Checking expected rendered names"
+          echo "========================================"
+
+          grep -nE "^[[:space:]]*name:[[:space:]]*dpn-thanos-query-health[[:space:]]*$" /tmp/thanos-rendered.yaml || true
+          grep -nE "^[[:space:]]*name:[[:space:]]*dpn-thanos-sidecar-health[[:space:]]*$" /tmp/thanos-rendered.yaml || true
+
+          if ! grep -qE "^[[:space:]]*name:[[:space:]]*dpn-thanos-query-health[[:space:]]*$" /tmp/thanos-rendered.yaml; then
+            echo "ERROR: dpn-thanos-query-health is not rendered."
+            exit 1
+          fi
+
+          if ! grep -qE "^[[:space:]]*name:[[:space:]]*dpn-thanos-sidecar-health[[:space:]]*$" /tmp/thanos-rendered.yaml; then
+            echo "ERROR: dpn-thanos-sidecar-health is not rendered."
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Checking Helm release status"
+          echo "========================================"
+
+          HELM_STATUS="$(helm status "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.info.status' || echo not-found)"
+          echo "Current Helm status: $HELM_STATUS"
+
+          if echo "$HELM_STATUS" | grep -q "pending"; then
+            echo "Helm release $RELEASE_NAME is stuck in $HELM_STATUS."
+
+            helm history "$RELEASE_NAME" -n "$NAMESPACE" || true
+
+            LAST_DEPLOYED_REVISION="$(helm history "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null \
+              | jq -r '[.[] | select(.status=="deployed")] | last | .revision // empty')"
+
+            if [ -n "$LAST_DEPLOYED_REVISION" ]; then
+              echo "Rolling back to last deployed revision: $LAST_DEPLOYED_REVISION"
+
+              helm rollback "$RELEASE_NAME" "$LAST_DEPLOYED_REVISION" \
+                -n "$NAMESPACE" \
+                --wait \
+                --timeout 5m || true
+            else
+              echo "No deployed revision found. Attempting uninstall."
+
+              helm uninstall "$RELEASE_NAME" \
+                -n "$NAMESPACE" \
+                --wait \
+                --timeout 5m || true
+
+              PENDING_SECRET="$(kubectl get secret -n "$NAMESPACE" \
+                -l owner=helm,name="$RELEASE_NAME" \
+                -o json 2>/dev/null \
+                | jq -r '.items[].metadata.name' \
+                | sort -V \
+                | tail -1 || true)"
+
+              if [ -n "$PENDING_SECRET" ]; then
+                echo "Deleting pending Helm secret: $PENDING_SECRET"
+                kubectl delete secret "$PENDING_SECRET" -n "$NAMESPACE" || true
+              else
+                echo "No pending Helm secret found."
+              fi
+            fi
+          fi
+
+          echo "========================================"
+          echo "Deploying Thanos"
+          echo "========================================"
+
+          set +e
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            # NOTE: no --wait/--atomic here. Long-lived Helm watches against
+            # the EKS API from this runner are unreliable and time out even
+            # when the rollout completes successfully on the cluster — see
+            # certificate-manager-cd.yml. Poll rollout status separately below.
+            helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --debug 2>&1 | tee /tmp/thanos-helm.log
+          else
+            helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              -f "$VALUES_FILE" \
+              "${EXTRA_ARGS[@]}" \
+              --wait \
+              --timeout 10m \
+              --atomic \
+              --debug 2>&1 | tee /tmp/thanos-helm.log
+          fi
+
+          RC=$?
+
+          echo "========================================"
+          echo "FULL HELM ERROR"
+          echo "========================================"
+
+          cat /tmp/thanos-helm.log
+
+          if [ "$RC" -ne 0 ]; then
+            echo "Helm upgrade/install failed with exit code $RC"
+            exit "$RC"
+          fi
+
+          set -e
+
+          echo "========================================"
+          echo "Waiting for Thanos Query rollout"
+          echo "========================================"
+
+          if [ "${{ inputs.cloud }}" = "aws" ]; then
+            ROLLOUT_OK=false
+            for attempt in 1 2 3 4 5; do
+              if kubectl rollout status deployment/dpn-thanos-query-health -n "$NAMESPACE" --timeout=60s; then
+                ROLLOUT_OK=true
+                break
+              fi
+              echo "Rollout status attempt $attempt/5 did not complete within 60s — retrying..."
+              sleep 10
+            done
+            if [ "$ROLLOUT_OK" != "true" ]; then
+              echo "::error::Deployment dpn-thanos-query-health did not report ready after 5 attempts."
+              exit 1
+            fi
+          else
+            kubectl rollout status deployment/dpn-thanos-query-health \
+              -n "$NAMESPACE" \
+              --timeout=300s
+          fi
+
+          echo "========================================"
+          echo "Thanos resources"
+          echo "========================================"
+
+          kubectl get pods -n "$NAMESPACE" | grep thanos || true
+          kubectl get svc -n "$NAMESPACE" | grep thanos || true
+          kubectl get deploy -n "$NAMESPACE" | grep thanos || true
+          kubectl get endpoints -n "$NAMESPACE" | grep thanos || true
+          kubectl get endpointslice -n "$NAMESPACE" | grep thanos || true
+
+          echo "========================================"
+          echo "Validating Thanos services"
+          echo "========================================"
+
+          kubectl get svc dpn-thanos-query-health -n "$NAMESPACE"
+          kubectl get svc dpn-thanos-sidecar-health -n "$NAMESPACE"
+
+          THANOS_QUERY_PORTS="$(kubectl get endpoints dpn-thanos-query-health \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.subsets[*].ports[*].port}' 2>/dev/null || true)"
+
+          echo "Thanos Query endpoint ports: $THANOS_QUERY_PORTS"
+
+          if ! echo "$THANOS_QUERY_PORTS" | grep -wq "9091"; then
+            echo "dpn-thanos-query-health has no ready backend on port 9091"
+
+            kubectl get endpoints dpn-thanos-query-health \
+              -n "$NAMESPACE" \
+              -o yaml || true
+
+            exit 1
+          fi
+
+          echo "Thanos Query endpoint validation passed."
+
+          echo "========================================"
+          echo "Testing Thanos Query health endpoint"
+          echo "========================================"
+
+          kubectl run thanos-query-curl-test \
+            -n "$NAMESPACE" \
+            --image=curlimages/curl:8.8.0 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- sh -c "curl -fsS -I --max-time 10 http://dpn-thanos-query-health:9091/-/healthy"
+
+          echo "========================================"
+          echo "Testing Thanos Query ready endpoint"
+          echo "========================================"
+
+          kubectl run thanos-query-ready-curl-test \
+            -n "$NAMESPACE" \
+            --image=curlimages/curl:8.8.0 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- sh -c "curl -fsS -I --max-time 10 http://dpn-thanos-query-health:9091/-/ready"
+
+          echo "========================================"
+          echo "Checking Thanos stores"
+          echo "========================================"
+
+          kubectl run thanos-query-stores-test \
+            -n "$NAMESPACE" \
+            --image=curlimages/curl:8.8.0 \
+            --restart=Never \
+            --rm \
+            --attach \
+            --command -- sh -c "curl -fsS --max-time 10 http://dpn-thanos-query-health:9091/api/v1/stores || true"
+
+          echo "========================================"
+          echo "Thanos logs"
+          echo "========================================"
+
+          kubectl logs -n "$NAMESPACE" \
+            -l app.kubernetes.io/name=thanos \
+            --tail=150 || true
+
+          echo "========================================"
+          echo "Recent Thanos events"
+          echo "========================================"
+
+          kubectl get events -n "$NAMESPACE" \
+            --sort-by=.metadata.creationTimestamp | grep -i thanos | tail -30 || true
+
+          echo "Thanos deployment completed."
