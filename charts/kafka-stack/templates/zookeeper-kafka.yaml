@@ -1,0 +1,252 @@
+{{- if .Values.kafka.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.zookeeper.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.zookeeper.name }}
+spec:
+  replicas: {{ .Values.zookeeper.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.zookeeper.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.zookeeper.name }}
+    spec:
+      {{- if (dig "persistence" "enabled" false .Values.zookeeper) }}
+      securityContext:
+        fsGroup: {{ dig "persistence" "fsGroup" 1001 .Values.zookeeper }}
+      {{- end }}
+      containers:
+        - name: zookeeper
+          image: "{{ .Values.zookeeper.image.repository }}:{{ .Values.zookeeper.image.tag }}"
+          imagePullPolicy: {{ .Values.zookeeper.image.pullPolicy }}
+          ports:
+            - name: client
+              containerPort: {{ .Values.zookeeper.service.port }}
+              protocol: TCP
+          env:
+{{- range $key, $value := .Values.zookeeper.env }}
+            - name: {{ $key }}
+              value: "{{ $value }}"
+{{- end }}
+          resources:
+{{ toYaml .Values.zookeeper.resources | indent 12 }}
+
+          volumeMounts:
+            - name: zookeeper-data
+              mountPath: /var/lib/zookeeper/data
+              subPath: data
+            - name: zookeeper-data
+              mountPath: /var/lib/zookeeper/log
+              subPath: log
+      volumes:
+        - name: zookeeper-data
+{{- if (dig "persistence" "enabled" false .Values.zookeeper) }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.zookeeper.name }}-pvc
+{{- else }}
+          emptyDir: {}
+{{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.zookeeper.service.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.zookeeper.name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Values.zookeeper.name }}
+  ports:
+    - name: client
+      port: {{ .Values.zookeeper.service.port }}
+      targetPort: {{ .Values.zookeeper.service.port }}
+      protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.kafka.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafka.name }}
+spec:
+  replicas: {{ .Values.kafka.replicaCount }}
+
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: {{ .Values.kafka.name }}
+
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.kafka.name }}
+
+    spec:
+      securityContext:
+        runAsUser: {{ .Values.kafka.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.kafka.securityContext.runAsGroup }}
+        fsGroup: {{ .Values.kafka.securityContext.fsGroup }}
+        fsGroupChangePolicy: Always
+
+      initContainers:
+        - name: seed-kafka-config
+          image: "{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          securityContext:
+            runAsUser: {{ .Values.kafka.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.kafka.securityContext.runAsGroup }}
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - sh
+            - -ec
+            - |
+              echo "Seeding /etc/kafka into writable volume..."
+
+              mkdir -p /kafka-config
+
+              if [ -d /etc/kafka ]; then
+                cp -R /etc/kafka/* /kafka-config/ 2>/dev/null || true
+              fi
+
+              echo "Kafka config seeded successfully."
+              ls -la /kafka-config
+          volumeMounts:
+            - name: kafka-config
+              mountPath: /kafka-config
+
+      containers:
+        - name: kafka
+          image: "{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          terminationMessagePolicy: FallbackToLogsOnError
+
+          command:
+            - sh
+            - -c
+            - |
+              echo "Starting Kafka using Confluent entrypoint..."
+              echo "User: $(id)"
+              echo "Preparing writable Kafka data directory..."
+              mkdir -p /tmp/kafka-data
+              chmod -R 0775 /tmp/kafka-data || true
+
+              echo "Checking writable paths..."
+              ls -ld /etc/kafka /tmp /tmp/kafka-data /var/log/kafka || true
+
+              echo "Kafka environment:"
+              env | grep -E '^KAFKA_' | sort || true
+
+              echo "Starting /etc/confluent/docker/run..."
+              # Stream Kafka's real output straight to the pod logs (tee also
+              # keeps a copy). Do NOT use `set -e` above or redirect to a file
+              # only — that hides the actual startup error.
+              /etc/confluent/docker/run 2>&1 | tee /tmp/kafka-startup.log
+              EXIT_CODE=$?
+
+              echo "Kafka exited with code ${EXIT_CODE}"
+              echo "Sleeping for 300 seconds to allow log inspection..."
+              sleep 300
+
+              exit ${EXIT_CODE}
+
+          securityContext:
+            runAsUser: {{ .Values.kafka.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.kafka.securityContext.runAsGroup }}
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          ports:
+            - name: kafka
+              containerPort: {{ .Values.kafka.service.port }}
+              protocol: TCP
+            {{- if .Values.kafka.service.internalPort }}
+            - name: internal
+              containerPort: {{ .Values.kafka.service.internalPort }}
+              protocol: TCP
+            {{- end }}
+
+          env:
+{{- range $key, $value := .Values.kafka.env }}
+            - name: {{ $key }}
+              value: "{{ $value }}"
+{{- end }}
+
+          resources:
+{{ toYaml .Values.kafka.resources | indent 12 }}
+
+          volumeMounts:
+            - name: kafka-config
+              mountPath: /etc/kafka
+
+            #- name: kafka-data
+            #  mountPath: /var/lib/kafka/data
+
+            - name: kafka-logs
+              mountPath: /var/log/kafka
+
+            - name: tmp
+              mountPath: /tmp
+            - name: kafka-data
+              mountPath: /tmp/kafka-data
+      volumes:
+        - name: kafka-config
+          emptyDir: {}
+
+        - name: kafka-logs
+          emptyDir: {}
+
+        - name: tmp
+          emptyDir: {}
+
+        - name: kafka-data
+{{- if .Values.kafka.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.kafka.name }}-pvc
+{{- else }}
+          emptyDir: {}
+{{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.kafka.service.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafka.name }}
+spec:
+  type: {{ .Values.kafka.service.type }}
+  selector:
+    app: {{ .Values.kafka.name }}
+  ports:
+    - name: kafka
+      port: {{ .Values.kafka.service.port }}
+      targetPort: {{ .Values.kafka.service.port }}
+      protocol: TCP
+    {{- if .Values.kafka.service.internalPort }}
+    # Inter-broker listener (advertised as dpn-kafka-health:<internalPort>).
+    # Single-broker controller-to-self traffic routes through this Service.
+    - name: internal
+      port: {{ .Values.kafka.service.internalPort }}
+      targetPort: {{ .Values.kafka.service.internalPort }}
+      protocol: TCP
+    {{- end }}
+{{- end }}
+ 

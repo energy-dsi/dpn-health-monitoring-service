@@ -1,0 +1,127 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "otel-collector.fullname" . }}
+  namespace: {{ .Values.namespace | default "ns-dpn-health-01" }}
+  labels:
+    {{- include "otel-collector.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "otel-collector.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+#        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ tpl (.Files.Get "otel-collector-config.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "otel-collector.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "otel-collector.serviceAccountName" . }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "otel-collector.selectorLabels" . | nindent 14 }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      containers:
+      - name: otel-collector
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        - "--config=/etc/otelcol/config.yaml"
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 10001
+          capabilities:
+            drop:
+              - ALL
+
+        ports:
+        - name: otlp-grpc
+          containerPort: 4317
+          protocol: TCP
+        - name: otlp-http
+          containerPort: 4318
+          protocol: TCP
+        - name: metrics
+          containerPort: 8888
+          protocol: TCP
+        - name: health
+          containerPort: 13133
+          protocol: TCP
+        env:
+        - name: CLUSTER_NAME
+          value: {{ .Values.clusterName | default "dpn-cluster" | quote }}
+        # When tls.enabled, health_check serves HTTPS (see otel-collector-config.yaml)
+        # so the probes must ask for it - a plain-HTTP probe against a TLS listener
+        # gets an HTTP 400 and the pod CrashLoops. The scheme is forced HERE rather
+        # than written into values.yaml on purpose: every values-<env>[-<cluster>].yaml
+        # overrides these probe maps, so a values-level default is one forgotten file
+        # away from a broken environment. Patching the merged map covers them all.
+        # kubelet does not verify the certificate on an HTTPS probe, so there is no
+        # CA to plumb in.
+        {{- $liveness := deepCopy .Values.livenessProbe }}
+        {{- $readiness := deepCopy .Values.readinessProbe }}
+        {{- if .Values.tls.enabled }}
+        {{- if $liveness.httpGet }}{{- $_ := set $liveness.httpGet "scheme" "HTTPS" }}{{- end }}
+        {{- if $readiness.httpGet }}{{- $_ := set $readiness.httpGet "scheme" "HTTPS" }}{{- end }}
+        {{- end }}
+        livenessProbe:
+          {{- toYaml $liveness | nindent 10 }}
+        readinessProbe:
+          {{- toYaml $readiness | nindent 10 }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otelcol
+          readOnly: true
+        {{- if .Values.tls.enabled }}
+        # Serving cert + key for the OTLP receivers. The paths the collector
+        # reads are built from these same values in otel-collector-config.yaml.
+        - name: tls
+          mountPath: {{ .Values.tls.mountPath }}
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: config
+        configMap:
+          name: {{ include "otel-collector.fullname" . }}
+      {{- if .Values.tls.enabled }}
+      - name: tls
+        secret:
+          secretName: {{ .Values.tls.secretName }}
+          # 0440, not the 0644 default: the container runs as uid 10001 with
+          # fsGroup 10001, so group-read is enough and the private key stays
+          # unreadable to anything else that ends up in the pod.
+          defaultMode: 0440
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+# Made with Bob

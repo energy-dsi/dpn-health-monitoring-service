@@ -1,0 +1,107 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+data:
+  # Secrets are deliberately absent from this file — client_secret and
+  # cookie_secret arrive as OAUTH2_PROXY_* env vars from the Secret instead,
+  # so this ConfigMap stays safe to read with `kubectl get cm -o yaml`.
+  oauth2-proxy.cfg: |
+    # TLS listener ONLY. Once tls_cert_file is set, oauth2-proxy serves the
+    # secure listener exclusively and never binds a plain-HTTP one, whatever
+    # http_address says — it is dropped without a warning in the log. So the
+    # Service and the kubelet probes both target 4443, and http_address is
+    # deliberately absent: adding it back does not produce a probe endpoint,
+    # it just produces a port that quietly refuses every connection.
+    https_address = "0.0.0.0:4443"
+    tls_cert_file = "/tls/tls.crt"
+    tls_key_file = "/tls/tls.key"
+
+    provider = "keycloak-oidc"
+    client_id = "{{ .Values.keycloak.clientId }}"
+
+    # Split-horizon Keycloak, with no KC_HOSTNAME pinned on it — so every URL
+    # is chosen per caller and discovery cannot be trusted to describe what the
+    # browser sees. Discovery is skipped and each endpoint pinned by hand:
+    #   login_url  -> public   (the browser follows it, so it must be the
+    #                           Keycloak LoadBalancer address, not the Service)
+    #   redeem_url -> internal, cross-namespace (this pod calls it)
+    #   jwks       -> internal, cross-namespace
+    #
+    # oidc_issuer_url follows the INTERNAL URL, not the public one: it is
+    # compared against the token's `iss` claim, and Keycloak derives that claim
+    # from the Host header of the redeem call above — which is the in-cluster
+    # name. See oauth2-proxy.issuerUrl in _helpers.tpl.
+    oidc_issuer_url = "{{ include "oauth2-proxy.issuerRealmUrl" . }}"
+    skip_oidc_discovery = true
+    login_url = "{{ include "oauth2-proxy.realmUrl" . }}/protocol/openid-connect/auth"
+    redeem_url = "{{ include "oauth2-proxy.internalRealmUrl" . }}/protocol/openid-connect/token"
+    oidc_jwks_url = "{{ include "oauth2-proxy.internalRealmUrl" . }}/protocol/openid-connect/certs"
+
+    # Trust the DPN CA for the redeem/JWKS calls above. ca.crt rides in the
+    # same kubernetes.io/tls Secret as the serving cert, so this assumes the
+    # DPN CA that signed dpn-health-tls also signed Keycloak's certificate.
+    provider_ca_files = ["/tls/ca.crt"]
+    {{- if .Values.keycloak.insecureSkipVerify }}
+
+    # Keycloak's certificate does not carry a SAN for its in-cluster name.
+    ssl_insecure_skip_verify = true
+    {{- end }}
+
+    redirect_url = "{{ include "oauth2-proxy.externalUrl" . }}/oauth2/callback"
+
+    # Every host oauth2-proxy is allowed to send the browser to via an `rd`
+    # parameter. Anything not listed here is silently discarded and replaced
+    # with "/" — IsValidRedirect compares hostname AND port, so the port is
+    # part of each entry.
+    #
+    #   1. this proxy's own host — post-login "back to where you were"
+    #   2. Keycloak's browser-facing host — REQUIRED for logout. The portal's
+    #      "Log out" link is /oauth2/sign_out?rd=<Keycloak end-session URL>
+    #      (app/dpn-portal/main.py's _logout_url), because with
+    #      skip_oidc_discovery=true this proxy never learns
+    #      end_session_endpoint and cannot end the SSO session itself. Without
+    #      Keycloak listed here, sign_out drops that rd, redirects to "/", and
+    #      the user is transparently re-authenticated from the still-live
+    #      Keycloak session — i.e. the logout button appears to do nothing.
+    whitelist_domains = ["{{ include "oauth2-proxy.externalHost" . }}", "{{ include "oauth2-proxy.keycloakPublicHost" . }}"]
+    scope = "{{ .Values.keycloak.scope }}"
+
+    # RBAC gate: only these realm roles get through. The claim is "roles", not
+    # oauth2-proxy's "groups" default — this realm carries realm roles in a
+    # custom claim via the realm-roles-claim protocol mapper.
+    oidc_groups_claim = "roles"
+    allowed_groups = [{{ range $i, $r := .Values.keycloak.allowedRoles }}{{ if $i }}, {{ end }}"{{ $r }}"{{ end }}]
+    email_domains = ["*"]
+    insecure_oidc_allow_unverified_email = true
+    skip_provider_button = true
+
+    # Forward the authenticated identity to the upstream UI. Today the
+    # OpenSearch security plugin is disabled, so these headers are informational
+    # and the gate is the allowed_groups check above; they are set now so that
+    # enabling the plugin later (proxy / proxycache auth) needs no proxy change.
+    # pass_basic_auth stays off: a stray Authorization: Basic header would
+    # collide with OpenSearch's basic auth domain once the plugin is on.
+    pass_user_headers = true
+    pass_basic_auth = false
+    user_id_claim = "preferred_username"
+
+    upstreams = ["{{ required "upstream.url is required: the in-cluster URL of the UI this proxy fronts" .Values.upstream.url }}"]
+
+    cookie_name = "{{ .Values.cookie.name }}"
+    cookie_secure = true
+    cookie_samesite = "{{ .Values.cookie.samesite }}"
+    cookie_expire = "{{ .Values.cookie.expire }}"
+    cookie_refresh = "{{ .Values.cookie.refresh }}"
+    {{- if eq .Values.sessionStore.type "redis" }}
+
+    # Token bundle stored server-side in the shared dpn-redis-ui-health
+    # release rather than the browser cookie — see sessionStore in
+    # values.yaml for why. cookie_secret above still encrypts the small
+    # session-ID cookie oauth2-proxy sends instead.
+    session_store_type = "redis"
+    redis_connection_url = "{{ .Values.sessionStore.redis.connectionUrl }}"
+    {{- end }}

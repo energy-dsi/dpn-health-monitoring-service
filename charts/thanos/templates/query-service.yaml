@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.query.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.query.name }}
+    app.kubernetes.io/name: thanos
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: query
+  annotations:
+{{- with .Values.query.service.annotations }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+spec:
+  type: {{ .Values.query.service.type }}
+  {{- if .Values.query.service.loadBalancerIP }}
+  loadBalancerIP: <<your specific value>>
+  {{- end }}
+
+  selector:
+    app: {{ .Values.query.name }}
+
+  ports:
+    - name: http
+      port: {{ .Values.query.httpPort }}
+      targetPort: {{ .Values.query.httpPort }}
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.query.grpcPort }}
+      targetPort: {{ .Values.query.grpcPort }}
+      protocol: TCP

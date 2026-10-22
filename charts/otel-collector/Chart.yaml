@@ -1,0 +1,18 @@
+apiVersion: v2
+name: otel-collector
+description: OpenTelemetry Collector for DPN Health Monitoring
+type: application
+version: 1.0.0
+appVersion: "0.95.0"
+
+keywords:
+  - opentelemetry
+  - observability
+  - monitoring
+  - telemetry
+
+maintainers:
+  - name: DevOps Team
+    email: devops@example.com
+
+# Made with Bob

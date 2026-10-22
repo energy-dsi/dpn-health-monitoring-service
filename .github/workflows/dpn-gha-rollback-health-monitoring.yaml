@@ -1,0 +1,355 @@
+name: DPN Rollback - Health Monitoring
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Choose DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "azure"
+        type: choice
+        options:
+          - azure
+          - aws
+      releaseName:
+        description: >-
+          Select the component to roll back, or 'all' to roll back the ENTIRE
+          health-monitoring stack together (in safe reverse-dependency order).
+          'all' is meaningful here because every component is deployed together
+          via the single master CD pipeline — they share the same deploy cycle.
+        required: true
+        type: choice
+        options:
+          - all
+          - oauth2-portal
+          - oauth2-perses
+          - oauth2-jaeger
+          - portal
+          - otel
+          - oauth2-osd
+          - redis-ui
+          - perses
+          - thanos
+          - jaeger
+          - data-prepper
+          - prometheus
+          - opensearch
+          - kafka
+
+      targetRevision:
+        description: >-
+          Revision to roll back to. "0" (default) = the previous stable revision —
+          automatically resolved per release by filtering for deployed/superseded
+          status (skips failed/pending-rollback revisions). Or enter a specific
+          revision number from "helm history <release>". When releaseName=all,
+          "0" is resolved independently for EACH release. Must be a non-negative
+          integer.
+        required: true
+        default: "0"
+        type: string
+
+      confirm:
+        description: 'Type the releaseName value again to confirm (exact match, e.g. "kafka" or "all")'
+        required: true
+        type: string
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  NAMESPACE: ns-dpn-health-01
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    name: Helm Rollback - Health Monitoring
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Validate Confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm }}" != "${{ inputs.releaseName }}" ]]; then
+            echo "ERROR: confirmation text '${{ inputs.confirm }}' does not match releaseName '${{ inputs.releaseName }}'."
+            echo "Aborting — nothing was touched."
+            exit 1
+          fi
+          echo "Confirmation matched. Proceeding with releaseName=${{ inputs.releaseName }}, targetRevision=${{ inputs.targetRevision }}"
+
+      - name: Validate Revision Format
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REV="${{ inputs.targetRevision }}"
+          if ! echo "$REV" | grep -Eq '^[0-9]+$'; then
+            echo "ERROR: targetRevision '$REV' is not a non-negative integer."
+            echo "Use 0 for the previous stable revision, or a revision number from 'helm history'."
+            exit 1
+          fi
+
+          echo "targetRevision '$REV' is valid."
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            if [[ "$key" == "NAMESPACE" ]]; then
+              echo "Skipping NAMESPACE from config file — this workflow uses the fixed namespace ns-dpn-health-01"
+              continue
+            fi
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}<<EOF" >> "$GITHUB_ENV"
+            echo "${value}" >> "$GITHUB_ENV"
+            echo "EOF" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      - name: Pre-Rollback Checklist
+        shell: bash
+        run: |
+          echo "CONFIRM BEFORE PROCEEDING:"
+          echo "1. Target: ${{ inputs.releaseName }}"
+          echo "2. Target revision: ${{ inputs.targetRevision }} (0 = previous stable revision, resolved per release)"
+          echo "3. You have checked 'helm history <release>' and confirmed the target revision is the one you want"
+          echo "4. Rolling back reverts chart version, values, and any templated config — it does NOT undo external side effects"
+          echo "5. Data PVCs (OpenSearch/Prometheus/Alertmanager) are unaffected by rollback either way"
+          echo "6. If releaseName=all: this rolls back EVERY component in namespace ${{ env.NAMESPACE }}, in reverse dependency order"
+          echo "   (oauth2-portal -> oauth2-perses -> oauth2-jaeger -> portal -> otel -> oauth2-osd -> redis-ui ->"
+          echo "    perses -> thanos -> jaeger -> data-prepper -> prometheus -> opensearch -> kafka)"
+          echo "7. Any component that is not installed, or has only one revision / no valid previous stable revision,"
+          echo "   is skipped and reported separately — it will NOT fail the run or block other components"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+          gcp-project-id: ${{ env.GCP_PROJECT_ID }}
+          gcp-region: ${{ env.GCP_REGION }}
+          gke-cluster: ${{ env.GKE_CLUSTER }}
+          gcp-workload-identity-provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          gcp-service-account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Helm Rollback
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "Target namespace for this run: $NAMESPACE"
+
+          # name | release — confirmed exact release names, REVERSE of master-CD order
+          COMPONENTS=(
+            "oauth2-portal|dpn-oauth2-proxy-portal"
+            "oauth2-perses|dpn-oauth2-proxy-perses"
+            "oauth2-jaeger|dpn-oauth2-proxy-jaeger"
+            "portal|dpn-portal"
+            "otel|dpn-otel-collector-health"
+            "oauth2-osd|dpn-oauth2-proxy-osd"
+            "redis-ui|dpn-redis-ui-health"
+            "perses|dpn-perses"
+            "thanos|dpn-thanos"
+            "jaeger|dpn-jaeger"
+            "data-prepper|dpn-data-prepper"
+            "prometheus|dpn-prometheus"
+            "opensearch|dpn-opensearch"
+            "kafka|dpn-kafka-stack"
+          )
+
+          SELECTED="${{ inputs.releaseName }}"
+          TARGET_REVISION="${{ inputs.targetRevision }}"
+
+          DONE=(); SKIPPED=(); NO_SCOPE=(); FAILED=()
+
+          for c in "${COMPONENTS[@]}"; do
+            NAME="${c%%|*}"; RELEASE="${c##*|}"
+
+            if [[ "$SELECTED" != "all" && "$SELECTED" != "$NAME" ]]; then
+              continue
+            fi
+
+            echo ""
+            echo "======================================================================"
+            echo "Component: $NAME  ($RELEASE)"
+            echo "======================================================================"
+
+            if ! helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+              echo "Release '$RELEASE' not found in namespace '$NAMESPACE'. Skipping — nothing installed to roll back."
+              SKIPPED+=("$NAME")
+              continue
+            fi
+
+            echo "--- Release history (before rollback) ---"
+            helm history "$RELEASE" -n "$NAMESPACE"
+
+            HISTORY_JSON=$(helm history "$RELEASE" -n "$NAMESPACE" -o json)
+
+            if [[ "$TARGET_REVISION" == "0" ]]; then
+              REV=$(echo "$HISTORY_JSON" | jq -r '
+                map(select(.status=="deployed" or .status=="superseded")) | .[-2].revision // empty
+              ')
+              if [[ -z "$REV" ]]; then
+                echo "NOTICE: '$RELEASE' has no previous deployed/superseded revision to roll back to"
+                echo "(either only one stable version exists, or every other revision is in a failed state)."
+                echo "No scope for rollback — skipping. This is not an error; investigate '$RELEASE' separately if needed."
+                NO_SCOPE+=("$NAME")
+                continue
+              fi
+              echo "Resolved 'previous stable' revision for '$RELEASE': $REV"
+            else
+              REV="$TARGET_REVISION"
+            fi
+
+            STATUS=$(echo "$HISTORY_JSON" | jq -r --arg rev "$REV" '.[] | select(.revision == ($rev|tonumber)) | .status')
+
+            if [[ -z "$STATUS" ]]; then
+              echo "ERROR: Revision '$REV' does not exist in history for '$RELEASE'. Skipping."
+              FAILED+=("$NAME")
+              continue
+            fi
+
+            if [[ "$STATUS" != "deployed" && "$STATUS" != "superseded" ]]; then
+              echo "ERROR: Revision '$REV' for '$RELEASE' has status '$STATUS'. Rollback blocked. Skipping."
+              FAILED+=("$NAME")
+              continue
+            fi
+
+            echo "Target revision '$REV' for '$RELEASE' has status '$STATUS' — OK to proceed."
+
+            echo "--- Dry run ---"
+            if ! helm rollback "$RELEASE" "$REV" -n "$NAMESPACE" --dry-run; then
+              echo "ERROR: Dry run failed for '$RELEASE' at revision '$REV'. Skipping real rollback."
+              FAILED+=("$NAME")
+              continue
+            fi
+
+            echo "--- Executing rollback ---"
+            if helm rollback "$RELEASE" "$REV" -n "$NAMESPACE" --wait --timeout 15m; then
+              kubectl rollout status deployment/"$RELEASE" -n "$NAMESPACE" --timeout=180s || \
+                echo "Note: rollout status check failed or timed out for '$RELEASE' — verify manually (release may not map 1:1 to a Deployment name)."
+
+              echo "--- Release history (after rollback) ---"
+              helm history "$RELEASE" -n "$NAMESPACE"
+
+              DONE+=("$NAME")
+            else
+              echo "ERROR: rollback of '$RELEASE' failed."
+              FAILED+=("$NAME")
+            fi
+          done
+
+          echo ""
+          echo "======================================================================"
+          echo "Rollback summary (releaseName=${SELECTED}, targetRevision=$TARGET_REVISION)"
+          echo "======================================================================"
+          echo "Rolled back (${#DONE[@]}): ${DONE[*]:-none}"
+          echo "Skipped - not installed (${#SKIPPED[@]}): ${SKIPPED[*]:-none}"
+          echo "Skipped - no rollback scope (${#NO_SCOPE[@]}): ${NO_SCOPE[*]:-none}"
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "Failed (${#FAILED[@]}): ${FAILED[*]}"
+            exit 1
+          fi
+          echo "Rollback completed."
+
+      - name: Post-Rollback Health Check
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          COMPONENTS=(
+            "oauth2-portal|dpn-oauth2-proxy-portal"
+            "oauth2-perses|dpn-oauth2-proxy-perses"
+            "oauth2-jaeger|dpn-oauth2-proxy-jaeger"
+            "portal|dpn-portal"
+            "otel|dpn-otel-collector-health"
+            "oauth2-osd|dpn-oauth2-proxy-osd"
+            "redis-ui|dpn-redis-ui-health"
+            "perses|dpn-perses"
+            "thanos|dpn-thanos"
+            "jaeger|dpn-jaeger"
+            "data-prepper|dpn-data-prepper"
+            "prometheus|dpn-prometheus"
+            "opensearch|dpn-opensearch"
+            "kafka|dpn-kafka-stack"
+          )
+
+          SELECTED="${{ inputs.releaseName }}"
+
+          echo "Waiting 30s before checking pod health..."
+          sleep 30
+
+          for c in "${COMPONENTS[@]}"; do
+            NAME="${c%%|*}"; RELEASE="${c##*|}"
+
+            if [[ "$SELECTED" != "all" && "$SELECTED" != "$NAME" ]]; then
+              continue
+            fi
+
+            if ! helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+              continue
+            fi
+
+            NOT_READY=$(kubectl get pods -n "$NAMESPACE" -o json | jq --arg rel "$RELEASE" '
+              [.items[] | select(.metadata.name | startswith($rel)) |
+               select((.status.containerStatuses // [])[0].ready != true or
+                      (((.status.containerStatuses // [{restartCount:0}])[0].restartCount) > 0))] | length
+            ')
+
+            if [[ "$NOT_READY" -gt 0 ]]; then
+              echo "WARNING: $NOT_READY pod(s) for '$RELEASE' ($NAME) are not ready or have restarted since rollback."
+              echo "  Check logs with: kubectl logs <pod> -n $NAMESPACE --previous"
+            else
+              echo "Pods for '$RELEASE' ($NAME) look healthy: ready, no restarts observed in this check."
+            fi
+          done
+
+      - name: Verification
+        shell: bash
+        run: |
+          echo "Using namespace: $NAMESPACE"
+
+          echo "Deployments:"
+          kubectl get deployments -n "$NAMESPACE"
+
+          echo "Pods:"
+          kubectl get pods -n "$NAMESPACE"
+
+          echo "Helm Releases (post-rollback):"
+          helm list -n "$NAMESPACE"
+
+          echo "Services:"
+          kubectl get svc -n "$NAMESPACE"

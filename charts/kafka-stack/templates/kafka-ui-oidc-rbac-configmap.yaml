@@ -1,0 +1,114 @@
+{{- if and .Values.kafka.enabled .Values.kafkaUi.enabled (.Values.kafkaUi.oidcRbac | default dict).enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.kafkaUi.name }}-oidc-rbac
+  namespace: {{ .Values.namespace }}
+data:
+  # Kafka UI uses its OWN property namespace (auth.oauth2.client.<id>), mapped
+  # by com.provectus.kafka.ui.config.auth.OAuthProperties — NOT spring.security.oauth2.
+  # Using the Spring path silently yields "OAuth2 enabled but no providers specified".
+  #
+  # Adapted from this repo's own config/kafka-ui/oauth2.yml (docker-compose
+  # only, never wired into this Helm chart) — same auth/rbac shape, but this
+  # environment has only ONE cluster (dpn-kafka-health), not the compose
+  # file's three, and the secret is sourced differently (see below).
+  oauth2-rbac.yml: |
+    auth:
+      type: OAUTH2
+      oauth2:
+        client:
+          keycloak:
+            provider: keycloak
+            clientId: {{ .Values.kafkaUi.oidcRbac.clientId }}
+            # Resolved from the KAFKA_UI_OIDC_CLIENT_SECRET env var (see
+            # templates/zookeeper-kafka-lb.yaml) — reuses the shared
+            # dpn-keycloak-shared-akv Secret's "client-secret" key, synced
+            # from Key Vault's KC-SERVICE-CLIENT-SECRET by this chart's own
+            # kafka-ui-oidc-kv-secrets SecretProviderClass (the same shared
+            # Secret charts/oauth2-proxy's releases also target).
+            clientSecret: ${KAFKA_UI_OIDC_CLIENT_SECRET}
+            scope: openid,email,profile
+            clientName: keycloak
+            authorizationGrantType: authorization_code
+            redirectUri: "https://{{ .Values.kafkaUi.oidcRbac.browserHost }}/login/oauth2/code/keycloak"
+            # Browser-facing: the user's browser is redirected here directly.
+            authorizationUri: "{{ .Values.kafkaUi.oidcRbac.keycloakBaseUrl }}/realms/{{ .Values.kafkaUi.oidcRbac.keycloakRealm }}/protocol/openid-connect/auth"
+            # Backend-to-backend: kafka-ui calls these over the cluster network.
+            tokenUri: "{{ .Values.kafkaUi.oidcRbac.keycloakBaseUrl }}/realms/{{ .Values.kafkaUi.oidcRbac.keycloakRealm }}/protocol/openid-connect/token"
+            userInfoUri: "{{ .Values.kafkaUi.oidcRbac.keycloakBaseUrl }}/realms/{{ .Values.kafkaUi.oidcRbac.keycloakRealm }}/protocol/openid-connect/userinfo"
+            jwkSetUri: "{{ .Values.kafkaUi.oidcRbac.keycloakBaseUrl }}/realms/{{ .Values.kafkaUi.oidcRbac.keycloakRealm }}/protocol/openid-connect/certs"
+            userNameAttribute: preferred_username
+            # REQUIRED for the rbac block below to work. Without roles-field, Kafka
+            # UI logs "Provider [keycloak] doesn't contain a roles field param name,
+            # mapping won't be performed" and extracts NO roles, so every "type:
+            # role" subject (dpnadmin/dpnreader) matches nothing and the logged-in
+            # user sees an empty UI, as if the cluster were down. "roles" is the
+            # claim emitted by the realm-roles-claim protocol mapper on
+            # dpn-service-client in dpn-authentication-service's
+            # charts/keycloak/scripts/configure-keycloak.sh.
+            custom-params:
+              type: oauth
+              roles-field: roles
+
+    # RBAC: map Keycloak realm roles (via the "roles" claim) to Kafka UI's
+    # built-in RBAC. dpnadmin gets full access; dpnreader is view-only.
+    # Scoped to this environment's one real cluster, dpn-kafka-health — not
+    # the three-cluster list from config/kafka-ui/oauth2.yml's docker-compose
+    # setup, which doesn't apply here.
+    rbac:
+      enabled: true
+      roles:
+        - name: "dpnadmin-role"
+          clusters:
+            - {{ .Values.kafkaUi.env.KAFKA_CLUSTERS_0_NAME | quote }}
+          subjects:
+            - provider: oauth
+              type: role
+              value: "dpnadmin"
+          permissions:
+            - resource: APPLICATIONCONFIG
+              actions: ["VIEW", "EDIT"]
+            - resource: CLUSTERCONFIG
+              actions: ["VIEW", "EDIT"]
+            - resource: TOPIC
+              value: ".*"
+              actions: ["VIEW", "CREATE", "EDIT", "DELETE", "MESSAGES_READ", "MESSAGES_PRODUCE", "MESSAGES_DELETE"]
+            - resource: CONSUMER
+              value: ".*"
+              actions: ["VIEW", "DELETE", "RESET_OFFSETS"]
+            - resource: SCHEMA
+              value: ".*"
+              actions: ["VIEW", "CREATE", "DELETE", "EDIT", "MODIFY_GLOBAL_COMPATIBILITY"]
+            - resource: CONNECT
+              value: ".*"
+              actions: ["VIEW", "EDIT", "CREATE", "RESTART"]
+            - resource: KSQL
+              actions: ["EXECUTE"]
+            - resource: ACL
+              actions: ["VIEW", "EDIT"]
+        - name: "dpnreader-role"
+          clusters:
+            - {{ .Values.kafkaUi.env.KAFKA_CLUSTERS_0_NAME | quote }}
+          subjects:
+            - provider: oauth
+              type: role
+              value: "dpnreader"
+          permissions:
+            - resource: APPLICATIONCONFIG
+              actions: ["VIEW"]
+            - resource: CLUSTERCONFIG
+              actions: ["VIEW"]
+            - resource: TOPIC
+              value: ".*"
+              actions: ["VIEW", "MESSAGES_READ"]
+            - resource: CONSUMER
+              value: ".*"
+              actions: ["VIEW"]
+            - resource: SCHEMA
+              value: ".*"
+              actions: ["VIEW"]
+            - resource: CONNECT
+              value: ".*"
+              actions: ["VIEW"]
+{{- end }}

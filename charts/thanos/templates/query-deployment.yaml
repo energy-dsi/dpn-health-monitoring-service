@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.query.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.query.name }}
+    app.kubernetes.io/name: thanos
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: query
+spec:
+  replicas: {{ .Values.query.replicas }}
+
+  selector:
+    matchLabels:
+      app: {{ .Values.query.name }}
+
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.query.name }}
+        app.kubernetes.io/name: thanos
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: query
+
+    spec:
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.securityContext.runAsGroup }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+
+      containers:
+        - name: thanos-query
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          args:
+            - query
+            - --http-address=0.0.0.0:{{ .Values.query.httpPort }}
+            - --grpc-address=0.0.0.0:{{ .Values.query.grpcPort }}
+            - --store={{ .Values.sidecar.serviceName }}:{{ .Values.sidecar.grpcPort }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.query.httpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.query.grpcPort }}
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup }}
+            capabilities:
+              drop:
+                - ALL
+
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: {{ .Values.query.httpPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: {{ .Values.query.httpPort }}
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+
+          resources:
+{{ toYaml .Values.query.resources | indent 12 }}

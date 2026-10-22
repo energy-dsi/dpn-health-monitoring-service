@@ -1,0 +1,160 @@
+{{- if and .Values.kafka.enabled .Values.kafkaUi.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.kafkaUi.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafkaUi.name }}
+spec:
+  replicas: {{ .Values.kafkaUi.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.kafkaUi.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.kafkaUi.name }}
+    spec:
+      containers:
+        - name: kafka-ui
+          image: "{{ .Values.kafkaUi.image.repository }}:{{ .Values.kafkaUi.image.tag }}"
+          imagePullPolicy: {{ .Values.kafkaUi.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+{{- range $key, $value := .Values.kafkaUi.env }}
+            - name: {{ $key }}
+              value: "{{ $value }}"
+{{- end }}
+{{- if (.Values.kafkaUi.oidcRbac | default dict).enabled }}
+            # Synced by this chart's own kafka-ui-oidc-kv-secrets
+            # SecretProviderClass into the shared dpn-keycloak-shared-akv
+            # Secret (the same one charts/oauth2-proxy's releases target) —
+            # see templates/kafka-ui-oidc-rbac-secretproviderclass.yaml.
+            - name: KAFKA_UI_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: dpn-keycloak-shared-akv
+                  key: client-secret
+            # Password for the truststore.jks below — the universal DPN
+            # platform password, read straight from tls-auth-secret (created
+            # once in this namespace by dpn-tls-cd) instead of an independent
+            # Key Vault re-sync of the same value.
+            - name: KAFKA_UI_TS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tls-auth-secret
+                  key: TRUSTSTORE_PASSWORD
+            - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+              value: "file:/config/oidc-rbac/oauth2-rbac.yml"
+            # Without this, the JVM's default trust store doesn't include
+            # the CA that signs Keycloak's TLS certificate, and the token
+            # exchange in Kafka UI's own OAuth2 login fails with
+            # "PKIX path building failed". dpn-tls carries a pre-built
+            # truststore.jks (copied into this namespace from ns-dpn-01,
+            # where dpn-federator-certificate-manager maintains it) — see
+            # the volume below.
+            - name: JAVA_OPTS
+              value: "-Djavax.net.ssl.trustStore=/etc/kafka-ui/tls/truststore.jks -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=$(KAFKA_UI_TS_PASSWORD)"
+{{- end }}
+{{- if (.Values.kafkaUi.tls | default dict).enabled }}
+            # Kafka UI's own embedded server only ever spoke plain HTTP —
+            # oauth2-proxy used to terminate the browser-facing HTTPS in
+            # front of it. Now that it's reached directly (no proxy), it
+            # has to terminate TLS itself or a browser hitting
+            # https://...:8082 gets a plaintext response back
+            # (ERR_SSL_PROTOCOL_ERROR). Spring Boot loads a PEM cert/key
+            # pair directly — no keystore conversion needed — from the
+            # same dpn-health-tls Secret every other browser-facing UI in
+            # this namespace already uses.
+            - name: SERVER_SSL_ENABLED
+              value: "true"
+            - name: SERVER_SSL_CERTIFICATE
+              value: "/etc/kafka-ui/https/tls.crt"
+            - name: SERVER_SSL_CERTIFICATE_PRIVATE_KEY
+              value: "/etc/kafka-ui/https/tls.key"
+{{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.kafkaUi.service.targetPort }}
+          volumeMounts:
+{{- if (.Values.kafkaUi.oidcRbac | default dict).enabled }}
+            - name: oidc-rbac-config
+              mountPath: /config/oidc-rbac
+              readOnly: true
+            - name: dpn-tls
+              mountPath: /etc/kafka-ui/tls
+              readOnly: true
+            # Not read directly — mounting it is what makes the CSI driver
+            # mirror KC-SERVICE-CLIENT-SECRET into the shared
+            # dpn-keycloak-shared-akv Secret that KAFKA_UI_OIDC_CLIENT_SECRET
+            # above reads (KAFKA_UI_TS_PASSWORD comes from tls-auth-secret
+            # instead, not from this sync). See
+            # templates/kafka-ui-oidc-rbac-secretproviderclass.yaml.
+            - name: oidc-kv-secrets-store
+              mountPath: /mnt/oidc-secrets-store
+              readOnly: true
+{{- end }}
+{{- if (.Values.kafkaUi.tls | default dict).enabled }}
+            - name: dpn-health-tls
+              mountPath: /etc/kafka-ui/https
+              readOnly: true
+{{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+{{- if or (.Values.kafkaUi.oidcRbac | default dict).enabled (.Values.kafkaUi.tls | default dict).enabled }}
+      volumes:
+{{- if (.Values.kafkaUi.oidcRbac | default dict).enabled }}
+        - name: oidc-rbac-config
+          configMap:
+            name: {{ .Values.kafkaUi.name }}-oidc-rbac
+        - name: dpn-tls
+          secret:
+            secretName: dpn-tls
+        - name: oidc-kv-secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.kafkaUi.name }}-oidc-kv-secrets
+{{- end }}
+{{- if (.Values.kafkaUi.tls | default dict).enabled }}
+        - name: dpn-health-tls
+          secret:
+            secretName: {{ .Values.kafkaUi.tls.secretName | default "dpn-health-tls" }}
+{{- end }}
+{{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.kafkaUi.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.kafkaUi.name }}
+  annotations:
+{{ toYaml .Values.kafkaUi.service.annotations | indent 4 }}
+spec:
+  type: {{ .Values.kafkaUi.service.type }}
+  {{- if .Values.kafkaUi.service.loadBalancerIP }}
+  loadBalancerIP: <<your specific value>>
+  {{- end }}
+  selector:
+    app: {{ .Values.kafkaUi.name }}
+  ports:
+    - name: http
+      port: {{ .Values.kafkaUi.service.port }}
+      targetPort: {{ .Values.kafkaUi.service.targetPort }}
+      protocol: TCP
+{{- end }}

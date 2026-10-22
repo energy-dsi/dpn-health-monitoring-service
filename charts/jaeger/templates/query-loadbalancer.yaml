@@ -1,0 +1,23 @@
+{{- if and .Values.loadBalancer.enabled .Values.query.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.loadBalancer.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: query
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+{{ toYaml .Values.loadBalancer.annotations | indent 4 }}
+spec:
+  type: {{ .Values.loadBalancer.type }}
+  selector:
+    app.kubernetes.io/name: jaeger
+    app.kubernetes.io/component: query
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: 16686
+{{- end }}

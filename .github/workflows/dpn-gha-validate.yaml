@@ -1,0 +1,161 @@
+name: DPN CD - Validate
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      cluster:
+        required: true
+        type: string
+      cloud:
+        required: true
+        type: string
+      ACR_NAME:
+        required: true
+        type: string
+      BASE_REGISTRY:
+        required: true
+        type: string
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      RESOURCE_GROUP:
+        required: true
+        type: string
+      AKS_CLUSTER:
+        required: true
+        type: string
+      KEY_VAULT_NAME:
+        required: true
+        type: string
+      NAMESPACE:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      AWS_REGION:
+        required: false
+        type: string
+      AWS_ACCOUNT_ID:
+        required: false
+        type: string
+      EKS_CLUSTER:
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Deployment
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Export Config as Env Vars
+        shell: bash
+        run: |
+          echo "ACR_NAME=${{ inputs.ACR_NAME }}" >> "$GITHUB_ENV"
+          echo "BASE_REGISTRY=${{ inputs.BASE_REGISTRY }}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{ inputs.AZURE_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "RESOURCE_GROUP=${{ inputs.RESOURCE_GROUP }}" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER=${{ inputs.AKS_CLUSTER }}" >> "$GITHUB_ENV"
+          echo "KEY_VAULT_NAME=${{ inputs.KEY_VAULT_NAME }}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${{ inputs.NAMESPACE }}" >> "$GITHUB_ENV"
+          echo "ARM_SUBSCRIPTION_ID=${{ inputs.ARM_SUBSCRIPTION_ID }}" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ inputs.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=${{ inputs.AWS_ACCOUNT_ID }}" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER=${{ inputs.EKS_CLUSTER }}" >> "$GITHUB_ENV"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+
+      - name: Verify Cluster Access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          helm ls -n "$NAMESPACE"
+          kubectl get all -n "$NAMESPACE"
+
+      - name: Validate Kubernetes Resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Pods"
+          echo "========================================"
+          kubectl get pods -n "$NAMESPACE" -o wide
+
+          echo "========================================"
+          echo "Services"
+          echo "========================================"
+          kubectl get svc -n "$NAMESPACE"
+
+          echo "========================================"
+          echo "Deployments"
+          echo "========================================"
+          kubectl get deployments -n "$NAMESPACE"
+
+          echo "========================================"
+          echo "StatefulSets"
+          echo "========================================"
+          kubectl get statefulsets -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "DaemonSets"
+          echo "========================================"
+          kubectl get daemonsets -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Jobs"
+          echo "========================================"
+          kubectl get jobs -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "PVCs"
+          echo "========================================"
+          kubectl get pvc -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Endpoints"
+          echo "========================================"
+          kubectl get endpoints -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "EndpointSlices"
+          echo "========================================"
+          kubectl get endpointslice -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Helm Releases"
+          echo "========================================"
+          helm list -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Validate expected services"
+          echo "========================================"
+
+          kubectl get svc dpn-kafka-health -n "$NAMESPACE"
+          kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+          kubectl get svc dpn-prometheus-health-ui -n "$NAMESPACE"
+          kubectl get svc dpn-thanos-query-health -n "$NAMESPACE" || true
+          kubectl get svc dpn-perses-health -n "$NAMESPACE" || true
+          kubectl get svc dpn-jaeger-query-health -n "$NAMESPACE" || true
+
+          echo "Validation completed."

@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dpn-dashboard-init
+  namespace: ns-dpn-health-01
+spec:
+  # Don't retry indefinitely if the script genuinely fails (e.g. bad ndjson)
+  backoffLimit: 2
+  # Auto-cleanup the Job object 5 minutes after it finishes, success or fail
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: dpn-dashboard-init
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: dashboard-init
+          image: curlimages/curl:8.6.0
+          securityContext:
+            allowPrivilegeEscalation: false
+          command: ["sh", "/scripts/init-opensearch-dashboard.sh"]
+          env:
+            # Actual in-cluster service name is singular "dashboard", not "dashboards"
+            - name: DASHBOARDS_URL
+              value: "http://dpn-opensearch-dashboard-health.ns-dpn-health-01.svc.cluster.local:5601"
+            # Security plugin enabled: OpenSearch now serves HTTPS. The
+            # script (config/opensearch/dashboard-provisioning/
+            # init-opensearch-dashboard.sh) already defaults to this scheme
+            # and to the datawriter/admin credentials below — it was written
+            # ahead of this rollout, only the env wiring was missing.
+            - name: OPENSEARCH_URL
+              value: "https://dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200"
+            - name: NDJSON_FILE
+              value: "/scripts/log-status-dashboard.ndjson"
+            - name: TEMPLATE_FILE
+              value: "/scripts/otel-logs-index-template.json"
+            - name: OS_USER
+              value: "datawriter"
+            - name: OS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: dpn-opensearch-health-oidc-secrets
+                  key: datawriter-password
+            # OSD's proxycache auth trusts this container's self-asserted
+            # identity headers (see opensearch_dashboards.yml's
+            # proxy_header_ip) — same trusted-proxy role oauth2-proxy-osd
+            # plays for real browser logins. dpnadmin -> all_access.
+            - name: OSD_USER
+              value: "admin"
+            - name: OSD_ROLES
+              value: "dpnadmin"
+          volumeMounts:
+            - name: dashboard-files
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: dashboard-files
+          configMap:
+            name: dpn-dashboard-provisioning-files
+            defaultMode: 0755

@@ -1,0 +1,681 @@
+trigger: none
+
+pool:
+  name: '<<YOUR AGENT POOL>>'
+
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  displayName: Target DPN Cluster (dpn02 = dev/devtest only)
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+# NOTE: the approval group is resolved automatically from the environment
+# (see the APPROVAL_GROUP variable below), so it is intentionally NOT a
+# selectable parameter — a pre-prod deploy cannot be approved by the dev group.
+- name: imageTag
+  type: string
+  default: "0.95.0"
+
+# dpn-portal is built from source (see dpn-portal-ci.yaml), not pulled from an
+# existing registry like the OTel Collector above — so it needs its own tag,
+# the short git SHA a dpn-portal-ci.yaml run printed at the end of its
+# BuildAndPush stage. No default: deploying without a known-good tag would
+# silently redeploy whatever image.tag the last release left in the cluster.
+- name: dpnPortalImageTag
+  type: string
+
+variables:
+  - name: CONFIG_FILE
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+  - name: CONFIG_FILE_CLUSTER
+    value: ".pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+  # Approver group by environment family:
+  #   pdev / ptest / puat  -> dsi-ppd (pre-prod)
+  #   devtest / test       -> dsi-devtest
+  #   dev                  -> dsi-dev
+  - ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-ppd
+  - ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+    - name: APPROVAL_GROUP
+      value: dsi-devtest
+  - ${{ else }}:
+    - name: APPROVAL_GROUP
+      value: dsi-dev
+
+stages:
+
+# ============================================================
+# 1. Init
+# ============================================================
+- stage: Init
+  displayName: Init
+  condition: succeeded()
+  jobs:
+  - job: Init
+    displayName: Load Deployment Config
+    steps:
+    - checkout: self
+
+    - script: |
+        set -euo pipefail
+
+        if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+          echo "ERROR: Environment '${{ parameters.environment }}' is configured for a single-DPN deployment and does not support cluster '${{ parameters.cluster }}'."
+          exit 1
+        fi
+
+        FILE="$(Build.SourcesDirectory)/$(CONFIG_FILE)"
+        if [ ! -f "$FILE" ]; then
+          FILE="$(Build.SourcesDirectory)/$(CONFIG_FILE_CLUSTER)"
+        fi
+
+        echo "Loading config from $FILE"
+        if [ ! -f "$FILE" ]; then
+          echo "Config file missing: $FILE"
+          exit 1
+        fi
+
+        jq -r 'to_entries[] | "\(.key)=\(.value)"' "$FILE" |
+        while IFS='=' read -r key value; do
+          echo "$key=$value"
+          echo "##vso[task.setvariable variable=$key]$value"
+        done
+      displayName: Load Config
+
+
+# ============================================================
+# 2. Approval Gate
+#
+# One single, explicit approval for the whole run, up front, before any
+# component deploys — not the incidental side effect of whichever stage
+# happens to hit the environment first (which is what Kafka being the first
+# environment-gated stage used to mean in practice). Every later stage
+# (Kafka onward) forms one unbroken dependsOn chain rooted at this stage —
+# see Kafka's dependsOn below — so none of them can run, including via ADO's
+# "run selected stages" / stage rerun, without this stage having succeeded
+# in the same run first. This does not add a second approval anywhere else:
+# every other stage still targets the same dsi-dev/dsi-devtest/dsi-ppd
+# Environment, which ADO only prompts for once per run per environment —
+# this stage is simply what claims that one prompt, deliberately, first.
+# ============================================================
+- stage: Approval
+  displayName: Approval Gate
+  dependsOn: Init
+  condition: succeeded('Init')
+  jobs:
+  - deployment: ApprovalGate
+    displayName: Approve deployment
+    ${{ if or(eq(parameters.environment, 'pdev'), eq(parameters.environment, 'ptest'), eq(parameters.environment, 'puat')) }}:
+      environment: dsi-ppd
+    ${{ elseif or(eq(parameters.environment, 'devtest'), eq(parameters.environment, 'test')) }}:
+      environment: dsi-devtest
+    ${{ else }}:
+      environment: dsi-dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              echo "Approved. Deploying to ${{ parameters.environment }} (cluster: ${{ parameters.cluster }})."
+            displayName: Approved - proceeding with deployment
+
+
+# ============================================================
+# 3. ValidateRequiredSecrets
+#
+# Every secret a component syncs directly from Key Vault (KC-SERVICE-CLIENT-
+# SECRET for Kafka, the three KC-OPENSEARCH-* passwords for OpenSearch) must
+# already exist in that environment's Key Vault before ANY stage runs — none
+# of them are created by this pipeline. Also checks that tls-auth-secret (the
+# universal keystore/truststore/p12 password Secret) already exists in this
+# namespace — that one isn't synced from Key Vault by this pipeline at all,
+# it is created directly by dpn-tls-cd (dpn-federator-certificate-manager),
+# so a Key Vault check alone would not catch dpn-tls-cd simply not having
+# been (re)run against this environment yet. Kafka UI and Data Prepper both
+# read it. Data Prepper needs no Key Vault check of its own here: besides
+# tls-auth-secret it also reuses OpenSearch's already-synced Secret for its
+# datawriter password (see data-prepper's templates/deployment.yaml) rather
+# than pulling its own copy, and its dependsOn below already waits on both
+# the Kafka and OpenSearch stages. Checking everything else up front, before
+# Kafka (the first component stage), catches a missing/misnamed secret with
+# one clear error instead of a FailedMount/DeadlineExceeded/
+# CreateContainerConfigError deep inside whichever stage hits it first.
+# Read-only: it never creates or writes anything, only checks existence.
+# See validate-required-secrets-cd.yaml.
+# ============================================================
+- stage: ValidateRequiredSecrets
+  displayName: Validate Required Secrets
+  dependsOn: Approval
+  condition: succeeded('Approval')
+  jobs:
+  - template: validate-required-secrets-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 4. Kafka
+# ============================================================
+- stage: Kafka
+  displayName: Kafka
+  dependsOn: ValidateRequiredSecrets
+  condition: succeeded('ValidateRequiredSecrets')
+  jobs:
+  - template: kafka-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 5. OpenSearch
+# ============================================================
+- stage: OpenSearch
+  displayName: OpenSearch
+  dependsOn: Kafka
+  condition: succeeded('Kafka')
+  jobs:
+  - template: opensearch-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 6. Prometheus
+# ============================================================
+- stage: Prometheus
+  displayName: Prometheus
+  dependsOn: OpenSearch
+  condition: succeeded('OpenSearch')
+  jobs:
+  - template: prometheus-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 7. Thanos
+# Depends on Prometheus
+# ============================================================
+- stage: Thanos
+  displayName: Thanos
+  dependsOn: Prometheus
+  condition: succeeded('Prometheus')
+  jobs:
+  - template: thanos-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 8. Data Prepper
+# Depends on Kafka + OpenSearch
+# ============================================================
+- stage: DataPrepper
+  displayName: Data Prepper
+  dependsOn:
+    - Kafka
+    - OpenSearch
+  condition: and(
+    succeeded('Kafka'),
+    succeeded('OpenSearch')
+    )
+  jobs:
+  - template: data-prepper-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 9. Jaeger
+# Depends on Kafka + OpenSearch
+# ============================================================
+- stage: Jaeger
+  displayName: Jaeger
+  dependsOn:
+    - Kafka
+    - OpenSearch
+  condition: and(
+    succeeded('Kafka'),
+    succeeded('OpenSearch')
+    )
+  jobs:
+  - template: jaeger-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 10. Perses
+# Depends on Prometheus + Thanos
+# ============================================================
+- stage: Perses
+  displayName: Perses
+  dependsOn:
+    - Prometheus
+    - Thanos
+  condition: and(
+    succeeded('Prometheus'),
+    succeeded('Thanos')
+    )
+  jobs:
+  - template: perses-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 11. OTel Collector
+# Depends on Kafka + OpenSearch + Data Prepper + Jaeger
+# ============================================================
+- stage: OTel
+  displayName: OTel
+  dependsOn:
+    - Kafka
+    - OpenSearch
+    - DataPrepper
+    - Jaeger
+  condition: and(
+    succeeded('Kafka'),
+    succeeded('OpenSearch'),
+    succeeded('DataPrepper'),
+    succeeded('Jaeger')
+    )
+  jobs:
+  - template: dpn-otel-collector-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      imageTag: ${{ parameters.imageTag }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 12. Build dpn-portal image
+#
+# dpn-portal (app/dpn-portal) is the one component in this repo built from
+# source rather than pulled from an existing registry. Building, scanning,
+# signing and pushing its image is now a separate pipeline —
+# .pipelines/azure-pipelines/ci-pipelines/dpn-portal-ci.yaml — run by hand
+# beforehand; this stage only deploys the resulting image (parameters.
+# dpnPortalImageTag) via the now deploy-only dpn-portal-image-cd.yaml.
+# charts/dpn-portal/values.yaml leaves image.repository/tag blank on purpose
+# and fails to render without them, so the "portal" component of the
+# OAuth2Proxy stage below (which deploys the gateway IN FRONT of dpn-portal)
+# needs this stage to have already put a working image behind it.
+# ============================================================
+- stage: DpnPortalImage
+  displayName: Deploy dpn-portal image
+  dependsOn:
+    - Kafka
+    - OpenSearch
+    - Jaeger
+    - Prometheus
+    - Thanos
+    - Perses
+  condition: and(
+    succeeded('Kafka'),
+    succeeded('OpenSearch'),
+    succeeded('Jaeger'),
+    succeeded('Prometheus'),
+    succeeded('Thanos'),
+    succeeded('Perses')
+    )
+  jobs:
+  - template: dpn-portal-image-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+      imageTag: ${{ parameters.dpnPortalImageTag }}
+
+
+# ============================================================
+# 11a. OAuth2 Proxy — Keycloak gateway for every observability UI
+#
+# This stage replaces the former Nginx Observability Proxy stage outright.
+# Where nginx was one Deployment multiplexing every UI behind Basic Auth, this
+# is one oauth2-proxy release per UI, each terminating its own HTTPS and
+# authenticating against the Keycloak in ns-dpn-01. Keycloak itself is not
+# deployed here — only the client side, into ns-dpn-health-01.
+#
+# The jobs are CHAINED, not parallel. Every release publishes a port on the
+# same static internal LoadBalancer address, and Azure reconciles that address
+# unreliably when several Services mutate it simultaneously. The "portal"
+# job additionally depends on DpnPortalImage above having already pushed an
+# image dpn-portal can pull.
+#
+# The Validate stage below DOES depend on this one: since nginx is gone, these
+# releases are the only route to any observability UI, so a run that finishes
+# green while one is not serving would be reporting a success nobody can use.
+# That does mean a fresh environment fails at Validate until the
+# manually-created Secrets and Keycloak callbacks this needs exist — that
+# configuration is deliberately absent from git. See
+# charts/oauth2-proxy/README.md.
+# ============================================================
+- stage: OAuth2Proxy
+  displayName: OAuth2 Proxy (Keycloak)
+  dependsOn:
+    - Kafka
+    - OpenSearch
+    - Jaeger
+    - Prometheus
+    - Thanos
+    - Perses
+    - DpnPortalImage
+  condition: and(
+    succeeded('Kafka'),
+    succeeded('OpenSearch'),
+    succeeded('Jaeger'),
+    succeeded('Prometheus'),
+    succeeded('Thanos'),
+    succeeded('Perses'),
+    succeeded('DpnPortalImage')
+    )
+  jobs:
+  - template: oauth2-proxy-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      component: opensearch
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+  - template: oauth2-proxy-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      component: jaeger
+      dependsOnJob: DeployOAuth2Proxy_opensearch
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+  # prometheus/thanos deliberately have no oauth2-proxy gateway -- neither UI
+  # needs direct browser access; both are consumed through Perses/Grafana
+  # dashboards instead. Removed from this chain, so perses now follows jaeger
+  # directly. The Prometheus/Thanos component STAGES above still deploy the
+  # services themselves -- only their oauth2-proxy gateways are gone.
+  #
+  # airflow and kafka-ui also have no oauth2-proxy gateway here -- see
+  # charts/oauth2-proxy/README.md. Their component STAGES above still
+  # deploy the services themselves -- only their oauth2-proxy gateways are
+  # gone; each now handles its own login.
+  #
+  # kafka-ui-2 also has no oauth2-proxy gateway here -- its gateway was
+  # removed. It fronted a UI in ns-dpn-01 that this repo does not own, so a
+  # replacement direct LoadBalancer for it is out of scope here.
+  - template: oauth2-proxy-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      component: perses
+      dependsOnJob: DeployOAuth2Proxy_jaeger
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+  # New, not a nginx migration: dpn-portal has no prior cluster deployment,
+  # it only ran under docker-compose before now. See
+  # charts/oauth2-proxy/values-portal.yaml and charts/dpn-portal.
+  - template: oauth2-proxy-cd.yaml
+    parameters:
+      ServiceConnection: ${{ parameters.ServiceConnection }}
+      environment: ${{ parameters.environment }}
+      cluster: ${{ parameters.cluster }}
+      component: portal
+      dependsOnJob: DeployOAuth2Proxy_perses
+      approval_group: ${{ variables.APPROVAL_GROUP }}
+
+
+# ============================================================
+# 13. Validate
+# Runs LAST, after every deployable component including the proxies.
+#
+# OAuth2Proxy is a dependency on purpose: since the nginx basic-auth proxy was
+# removed, those eight releases are the only route to any observability UI, so
+# a run that ends green while one of them is not serving would be reporting a
+# success nobody can use. Validate therefore asserts each proxy has a ready
+# replica and a LoadBalancer address, and fails the run if not.
+#
+# The cost of that choice: a brand-new environment fails here until the
+# KC-SERVICE-CLIENT-SECRET object exists in that environment's Key Vault
+# (synced into each release's own Secret via SecretProviderClass) and the
+# callbacks are registered on the Keycloak client — see
+# charts/oauth2-proxy/README.md.
+# ============================================================
+- stage: Validate
+  displayName: Validate
+  dependsOn:
+    - OTel
+    - Perses
+    - Thanos
+    - DataPrepper
+    - Jaeger
+    - OAuth2Proxy
+  condition: and(
+    succeeded('OTel'),
+    succeeded('Perses'),
+    succeeded('Thanos'),
+    succeeded('DataPrepper'),
+    succeeded('Jaeger'),
+    succeeded('OAuth2Proxy')
+    )
+  jobs:
+  - job: Validate
+    displayName: Validate Deployment
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Validate Kubernetes Resources
+      inputs:
+        azureSubscription: ${{ parameters.ServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+              CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+              CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            if [ -f "$CONFIG_FILE_CLUSTER" ]; then
+              CONFIG_FILE="$CONFIG_FILE_CLUSTER"
+            else
+              echo "Config file missing: $CONFIG_FILE"
+              exit 1
+            fi
+          fi
+
+          echo "Loading config from $CONFIG_FILE"
+
+          export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+          echo "RESOURCE_GROUP=$RESOURCE_GROUP"
+          echo "AKS_CLUSTER=$AKS_CLUSTER"
+          echo "NAMESPACE=$NAMESPACE"
+
+          az aks install-cli --kubelogin-version v0.2.19
+
+          az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+          az aks get-credentials \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER" \
+            --overwrite-existing
+
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "Checking namespace..."
+          kubectl get namespace "$NAMESPACE"
+
+          echo "========================================"
+          echo "Pods"
+          echo "========================================"
+          kubectl get pods -n "$NAMESPACE" -o wide
+
+          echo "========================================"
+          echo "Services"
+          echo "========================================"
+          kubectl get svc -n "$NAMESPACE"
+
+          echo "========================================"
+          echo "Deployments"
+          echo "========================================"
+          kubectl get deployments -n "$NAMESPACE"
+
+          echo "========================================"
+          echo "StatefulSets"
+          echo "========================================"
+          kubectl get statefulsets -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "DaemonSets"
+          echo "========================================"
+          kubectl get daemonsets -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Jobs"
+          echo "========================================"
+          kubectl get jobs -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "PVCs"
+          echo "========================================"
+          kubectl get pvc -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Endpoints"
+          echo "========================================"
+          kubectl get endpoints -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "EndpointSlices"
+          echo "========================================"
+          kubectl get endpointslice -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Helm Releases"
+          echo "========================================"
+          helm list -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Validate expected services"
+          echo "========================================"
+
+          kubectl get svc dpn-kafka-health -n "$NAMESPACE"
+          kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+          kubectl get svc dpn-prometheus-health-ui -n "$NAMESPACE"
+          kubectl get svc dpn-thanos-query-health -n "$NAMESPACE" || true
+          kubectl get svc dpn-perses-health -n "$NAMESPACE" || true
+          kubectl get svc dpn-jaeger-query-health -n "$NAMESPACE" || true
+
+          echo "========================================"
+          echo "Validate oauth2-proxy gateways"
+          echo "========================================"
+
+          # Since charts/nginx-observability was removed, these releases are
+          # the ONLY route to the UIs still fronted by a proxy. A proxy that
+          # is not serving means a UI nobody can open, so unlike the
+          # informational dumps above this section fails the run.
+          #
+          # prometheus/thanos/airflow/kafka-ui/kafka-ui-2 deliberately have
+          # no gateway of their own -- see the comment in the OAuth2Proxy
+          # stage above -- so they are not in this list; their kubectl get
+          # svc checks above still cover the underlying services.
+          #
+          # Failures are collected rather than exiting on the first, so one run
+          # reports every broken gateway instead of one per re-run.
+          PROXY_RELEASES="
+          dpn-oauth2-proxy-osd
+          dpn-oauth2-proxy-jaeger
+          dpn-oauth2-proxy-perses
+          dpn-oauth2-proxy-portal
+          "
+
+          PROXY_FAILED=""
+
+          for R in $PROXY_RELEASES; do
+            READY="$(kubectl get deployment "$R" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+            LB_IP="$(kubectl get svc "$R" -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+            PORT="$(kubectl get svc "$R" -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+
+            if [ -z "$READY" ]; then
+              echo "FAIL  $R - no deployment, or no ready replica"
+              PROXY_FAILED="$PROXY_FAILED $R"
+            elif [ -z "$LB_IP" ]; then
+              # Ready pods behind a Service with no address still means an
+              # unreachable UI, and it is the signature of an Azure
+              # LoadBalancer that could not take the shared static IP.
+              echo "FAIL  $R - $READY ready, but the Service has no LoadBalancer address"
+              PROXY_FAILED="$PROXY_FAILED $R"
+            else
+              echo "OK    $R - $READY ready, https://$LB_IP:$PORT"
+            fi
+          done
+
+          if [ -n "$PROXY_FAILED" ]; then
+            echo ""
+            echo "ERROR: these oauth2-proxy gateways are not serving:$PROXY_FAILED"
+            echo ""
+            echo "Each one is the only way into the UI behind it. Investigate with:"
+            echo "  kubectl describe deployment <release> -n $NAMESPACE"
+            echo "  kubectl logs -l app=<release> -n $NAMESPACE --tail=50"
+            echo "  kubectl describe svc <release> -n $NAMESPACE"
+            exit 1
+          fi
+
+          echo "All seven oauth2-proxy gateways are serving."
+
+          echo "Validation completed."

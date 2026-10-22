@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DSI DPN Portal</title>
+  <link rel="icon" href="data:,">
+  {# Carbon Design System CDN — styles only, no JS framework needed #}
+  <link rel="stylesheet" href="https://1.www.s81c.com/common/carbon/web-components/version/v2.1.0/themes.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body class="dpn-body">
+
+  {# ── Sidebar backdrop (click to close, mobile only) ──────────── #}
+  <div class="dpn-sidebar-backdrop" id="sidebarBackdrop"></div>
+
+  {# ── Left navigation sidebar ─────────────────────────────────── #}
+  <nav class="dpn-sidebar" id="sidebar" aria-label="Main navigation">
+
+    <a href="/" class="dpn-sidebar__brand">
+      <span class="dpn-sidebar__brand-prefix">DSI</span> DPN
+    </a>
+
+    <ul class="dpn-sidebar__list">
+      <li>
+        <a href="/" class="dpn-sidebar__link {% if active_page == 'dashboard' %}dpn-sidebar__link--active{% endif %}">
+          <span class="dpn-sidebar__icon">{% include "icons/home.html" %}</span>
+          <span>Home</span>
+        </a>
+      </li>
+    </ul>
+  </nav>
+
+  {# ── Carbon UI Shell ─────────────────────────────────────── #}
+  <header class="dpn-shell-header" role="banner">
+    <div class="dpn-shell-header__inner">
+
+      {# Left: hamburger (mobile only, toggles the sidebar drawer) #}
+      <div class="dpn-shell-header__left">
+        <button class="dpn-shell-header__menu-btn" id="menuBtn" aria-label="Open navigation" aria-expanded="false">
+          {% include "icons/menu.html" %}
+        </button>
+
+        {# Brand mark #}
+        <a href="/" class="dpn-shell-header__logo">
+          <span>DSI DPN</span>
+          <span>Platform</span>
+        </a>
+      </div>
+
+      {# Right: theme switcher + user actions #}
+      <div class="dpn-shell-header__right">
+
+        {# ── Theme switcher ──────────────────────────── #}
+        <!-- <div class="dpn-theme-switcher" id="themeSwitcher">
+          <button class="dpn-theme-switcher__btn" id="themeBtn"
+                  aria-haspopup="listbox" aria-expanded="false"
+                  aria-label="Change colour theme">
+            <span class="dpn-theme-switcher__icon" id="themeIcon">
+              {% include "icons/system.html" %}
+            </span>
+            <span class="dpn-theme-switcher__label" id="themeLabel">System</span>
+            {% include "icons/chevron.html" %}
+          </button>
+          <ul class="dpn-theme-switcher__menu" id="themeMenu" role="listbox" aria-label="Colour theme">
+            <li class="dpn-theme-switcher__option" role="option" data-theme="system" tabindex="0">
+              <span class="dpn-theme-switcher__opt-icon">{% include "icons/system.html" %}</span>
+              <span>System</span>
+            </li>
+            <li class="dpn-theme-switcher__option" role="option" data-theme="dark" tabindex="0">
+              <span class="dpn-theme-switcher__opt-icon">{% include "icons/moon.html" %}</span>
+              <span>Dark</span>
+            </li>
+            <li class="dpn-theme-switcher__option" role="option" data-theme="white" tabindex="0">
+              <span class="dpn-theme-switcher__opt-icon">{% include "icons/sun.html" %}</span>
+              <span>White</span>
+            </li>
+          </ul>
+        </div> -->
+
+        {% if username %}
+        <div class="dpn-shell-header__user">
+          <!-- <span class="dpn-shell-header__user-icon">
+            {% include "icons/user.html" %}
+          </span> -->
+          <span class="dpn-shell-header__role-badge">Hi, {{ username }}</span>
+          <!-- {% if groups %}
+          <span class="dpn-shell-header__role-badge">{{ groups[0] }}</span>
+          {% endif %} -->
+          <a href="{{ logout_url|default('/oauth2/sign_out') }}" id="logout-link" class="dpn-shell-header__signout">Sign out</a>
+        </div>
+        {% endif %}
+      </div>
+
+    </div>
+  </header>
+
+  {% if other_sign_out_urls %}
+  <script>
+    // Clearing THIS proxy's cookie and ending the Keycloak SSO session
+    // (logout_url above) does not touch any other UI's session - each
+    // oauth2-proxy release keeps its own separate cookie. So before
+    // following the real logout link, fire a sign_out beacon at every
+    // other UI's oauth2-proxy: /oauth2/sign_out is a plain cookie-clearing
+    // GET, safe to call cross-origin via <img> without CORS, and every
+    // beacon shares this page's TLS trust since all UIs sit on the same
+    // certificate-covered hostname (see charts/oauth2-proxy/README.md).
+    (function () {
+      var otherSignOutUrls = {{ other_sign_out_urls|tojson }};
+      var logoutLink = document.getElementById("logout-link");
+      logoutLink.addEventListener("click", function (event) {
+        event.preventDefault();
+        var target = logoutLink.href;
+        var pending = otherSignOutUrls.length;
+        var proceed = function () {
+          if (--pending <= 0) {
+            window.location.href = target;
+          }
+        };
+        if (pending === 0) {
+          window.location.href = target;
+          return;
+        }
+        otherSignOutUrls.forEach(function (url) {
+          var beacon = new Image();
+          beacon.onload = proceed;
+          beacon.onerror = proceed;
+          beacon.src = url;
+        });
+        // Beacons that never fire (e.g. a UI that is down) must not strand
+        // the user on this page forever.
+        setTimeout(function () {
+          window.location.href = target;
+        }, 2000);
+      });
+    })();
+  </script>
+  {% endif %}
+
+  {# ── Page Content ────────────────────────────────────────── #}
+  <main class="dpn-main" id="main-content">
+    {% block content %}{% endblock %}
+  </main>
+
+  {# ── Footer ──────────────────────────────────────────────── #}
+  <!-- <footer class="dpn-footer">
+    <span>NESO DPN Platform</span>
+  </footer> -->
+
+  {# ── Sidebar toggle script ───────────────────────────────── #}
+  <script>
+    (function () {
+      var menuBtn  = document.getElementById('menuBtn');
+      var sidebar  = document.getElementById('sidebar');
+      var backdrop = document.getElementById('sidebarBackdrop');
+
+      function openSidebar() {
+        sidebar.classList.add('dpn-sidebar--open');
+        backdrop.classList.add('dpn-sidebar-backdrop--open');
+        menuBtn.setAttribute('aria-expanded', 'true');
+      }
+      function closeSidebar() {
+        sidebar.classList.remove('dpn-sidebar--open');
+        backdrop.classList.remove('dpn-sidebar-backdrop--open');
+        menuBtn.setAttribute('aria-expanded', 'false');
+      }
+      function toggleSidebar(e) {
+        e.stopPropagation();
+        sidebar.classList.contains('dpn-sidebar--open') ? closeSidebar() : openSidebar();
+      }
+
+      menuBtn.addEventListener('click', toggleSidebar);
+      backdrop.addEventListener('click', closeSidebar);
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeSidebar(); });
+    })();
+  </script>
+
+  {# ── Theme switcher script ───────────────────────────────── #}
+  <script>
+    (function () {
+      var ICONS = {
+        system: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M26 16a9.9 9.9 0 0 1-2.93 7.068l-1.42-1.42a7.96 7.96 0 0 0 0-11.295l1.42-1.42A9.9 9.9 0 0 1 26 16zM8.35 22.648l-1.42 1.42A10 10 0 0 1 16 6v2a8 8 0 0 0-7.65 14.648zM16 4a12 12 0 1 0 12 12A12 12 0 0 0 16 4zm0 22a10 10 0 1 1 10-10 10 10 0 0 1-10 10zm-1-8H9v-2h6V9h2v9h-2z"/></svg>',
+        dark:   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M13.503 5.414a15.08 15.08 0 0 0 11.594 18.194 11.11 11.11 0 0 1-7.975 3.39c-.138 0-.278 0-.418-.007A11.094 11.094 0 0 1 13.503 5.414zm1.415-2.424a13 13 0 1 0 15.468 18.03A13.053 13.053 0 0 1 14.918 2.99z"/></svg>',
+        white:  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M16 12a4 4 0 1 0 4 4 4 4 0 0 0-4-4zm0 6a2 2 0 1 1 2-2 2 2 0 0 1-2 2zm-1-9V4h2v5zm0 18v-5h2v5zM4 15h5v2H4zm18 0h5v2h-5zM7.22 7.22l1.42 1.42-3.54 3.54-1.41-1.41zm16.97 16.97-3.54-3.54 1.42-1.42 3.54 3.54zM7.22 24.78l-1.41-1.41 3.54-3.54 1.42 1.42zm16.97-16.97-1.41-1.41 3.54-3.54 1.41 1.41z"/></svg>'
+      };
+      var LABELS = { system: 'System', dark: 'Dark', white: 'White' };
+
+      var btn    = document.getElementById('themeBtn');
+      var menu   = document.getElementById('themeMenu');
+      var icon   = document.getElementById('themeIcon');
+      var label  = document.getElementById('themeLabel');
+      var body   = document.body;
+      var options = document.querySelectorAll('.dpn-theme-switcher__option');
+
+      /* Theme switcher markup above is commented out pending redesign -
+         bail out instead of throwing on the now-missing elements. */
+      if (!btn) return;
+
+      /* Resolve 'system' to actual dark/white using prefers-color-scheme */
+      function resolveTheme(t) {
+        if (t !== 'system') return t;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'white';
+      }
+
+      /* Apply data-theme attribute to <body>; CSS vars do the rest */
+      function applyTheme(t) {
+        var resolved = resolveTheme(t);
+        body.setAttribute('data-theme', resolved);
+        icon.innerHTML  = ICONS[t];
+        label.textContent = LABELS[t];
+        /* mark active option */
+        options.forEach(function (o) {
+          o.setAttribute('aria-selected', o.dataset.theme === t ? 'true' : 'false');
+          o.classList.toggle('dpn-theme-switcher__option--active', o.dataset.theme === t);
+        });
+      }
+
+      /* Load saved preference or fall back to 'system' */
+      function loadTheme() {
+        try { return localStorage.getItem('dpn-theme') || 'system'; } catch(_) { return 'system'; }
+      }
+      function saveTheme(t) {
+        try { localStorage.setItem('dpn-theme', t); } catch(_) {}
+      }
+
+      /* Toggle dropdown */
+      function openMenu()  { menu.classList.add('dpn-theme-switcher__menu--open'); btn.setAttribute('aria-expanded', 'true'); }
+      function closeMenu() { menu.classList.remove('dpn-theme-switcher__menu--open'); btn.setAttribute('aria-expanded', 'false'); }
+      function toggleMenu() { menu.classList.contains('dpn-theme-switcher__menu--open') ? closeMenu() : openMenu(); }
+
+      btn.addEventListener('click', function (e) { e.stopPropagation(); toggleMenu(); });
+
+      options.forEach(function (o) {
+        function pick() {
+          var t = o.dataset.theme;
+          saveTheme(t);
+          applyTheme(t);
+          closeMenu();
+        }
+        o.addEventListener('click', pick);
+        o.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+      });
+
+      /* Close on outside click */
+      document.addEventListener('click', function () { closeMenu(); });
+
+      /* Re-apply when OS preference changes (only matters when mode = system) */
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+        if (loadTheme() === 'system') applyTheme('system');
+      });
+
+      /* Initialise */
+      applyTheme(loadTheme());
+    })();
+  </script>
+
+  {% block scripts %}{% endblock %}
+
+</body>
+</html>

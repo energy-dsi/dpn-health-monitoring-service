@@ -1,0 +1,59 @@
+namespace: ns-dpn-health-01
+
+imagePullSecret: ghcr-pull-secret-new
+
+name: dpn-data-prepper-health
+replicaCount: 1
+
+
+image:
+  repository: <<your specific value>>/data-prepper
+  tag: "2.6.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 4900
+
+kafka:
+  brokers:
+    - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+
+opensearch:
+  # Security plugin enabled: switched from http to https, and the datawriter
+  # service account (all_access via roles_mapping.yml) is now required.
+  # Password comes in as the DATAWRITER_PASSWORD env var (deployment.yaml,
+  # sourced from the dpn-opensearch-health-oidc-secrets Secret), substituted
+  # into a copy of pipelines.yaml by the generate-pipeline-config init
+  # container - Data Prepper's ${env:...} substitution does not resolve
+  # inside plugin-level config fields like the opensearch sink's password.
+  hosts:
+    - https://dpn-opensearch-health.ns-dpn-health-01.svc.cluster.local:9200
+  username: datawriter
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1536Mi
+  limits:
+    cpu: 1000m
+    # Raised from 1Gi - the JVM's default container-aware heap sizing (~25%
+    # of this limit, since no explicit -Xmx is set anywhere in this chart)
+    # was too small to drain a large backlog on the otel-logs Kafka topic,
+    # causing a sustained OutOfMemoryError crash loop.
+    memory: 4Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop:
+      - ALL

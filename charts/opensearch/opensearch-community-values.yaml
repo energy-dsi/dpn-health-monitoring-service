@@ -1,0 +1,381 @@
+
+fullnameOverride: dpn-opensearch-health
+masterService: dpn-opensearch-health
+
+
+singleNode: true
+replicas: 1
+
+image:
+  repository: "opensearchproject/opensearch"
+  tag: "2.11.0"
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "2Gi"
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
+
+opensearchJavaOpts: "-Xms2g -Xmx2g"
+
+persistence:
+  enabled: true
+  storageClass: "managed-premium"
+  size: 100Gi
+  enableInitChown: false
+
+# -----------------------------------------------------------------------
+# Security plugin — TLS (transport + HTTP) and admin/node identity.
+#
+# Reuses dpn-health-tls (mounted below via extraVolumes/extraVolumeMounts),
+# the same cert this namespace's oauth2-proxy releases already trust for
+# Keycloak — no new certificate. Its Subject DN (confirmed via
+# `openssl x509 -noout -subject` against the live secret:
+# "C=GB, O=DSI, CN=dpn-common") is used for BOTH admin_dn (so
+# securityadmin's first-boot bootstrap, gated by
+# allow_default_init_securityindex below, is trusted) and nodes_dn (so this
+# single node trusts its own cert for transport) — one cert, two roles,
+# no separate admin client certificate needed.
+#
+# dpn-health-tls's SAN does not cover dpn-opensearch-health, so transport
+# hostname verification is disabled, same workaround already accepted for
+# this cert elsewhere (see charts/kafka-stack's use of the equivalent
+# dpn-tls for Kafka UI).
+# -----------------------------------------------------------------------
+config:
+  opensearch.yml: |
+    cluster.name: dpn-prod-observability
+    network.host: 0.0.0.0
+
+    plugins.security.ssl.transport.pemcert_filepath: certs/tls.crt
+    plugins.security.ssl.transport.pemkey_filepath: certs/tls.key
+    plugins.security.ssl.transport.pemtrustedcas_filepath: certs/ca.crt
+    plugins.security.ssl.transport.enforce_hostname_verification: false
+
+    plugins.security.ssl.http.enabled: true
+    plugins.security.ssl.http.pemcert_filepath: certs/tls.crt
+    plugins.security.ssl.http.pemkey_filepath: certs/tls.key
+    plugins.security.ssl.http.pemtrustedcas_filepath: certs/ca.crt
+
+    # First-boot only: this cluster has never had security enabled before
+    # (no existing .opendistro_security index), so the security plugin
+    # bootstraps itself from the mounted securityConfig.config.data below
+    # automatically on startup. No separate securityadmin.sh job needed for
+    # this initial rollout. Later manual edits to the mounted config, on an
+    # already-initialized cluster, would need an explicit securityadmin.sh
+    # run to take effect — this flag only covers the empty-index case.
+    plugins.security.allow_default_init_securityindex: true
+
+    # dpn-health-tls lacks the "TLS Web Client Authentication" EKU, so it
+    # can't be used as securityadmin.sh's mTLS client cert (OpenSearch's
+    # transport layer rejects it with certificate_unknown) — there is no
+    # other admin cert available. This flag opts into the one REST path
+    # that can still push config changes to an already-initialized
+    # cluster without a client cert: PUT /_plugins/_security/api/securityconfig,
+    # which (unlike the per-resource endpoints) is allowed to overwrite
+    # reserved resources like the admin user. For dev/testing only — a
+    # proper client-auth-capable admin cert is the long-term fix.
+    plugins.security.unsupported.restapi.allow_securityconfig_modification: true
+
+    plugins.security.authcz.admin_dn:
+      - "CN=dpn-common,O=DSI,C=GB"
+    plugins.security.nodes_dn:
+      - "CN=dpn-common,O=DSI,C=GB"
+
+    plugins.security.audit.type: internal_opensearch
+    plugins.security.enable_snapshot_restore_privilege: true
+    plugins.security.check_snapshot_restore_write_privileges: true
+    plugins.security.restapi.roles_enabled: ["all_access", "security_rest_api_access"]
+
+    plugins.security.system_indices.enabled: true
+    plugins.security.system_indices.indices:
+      - ".plugins-ml-config"
+      - ".opendistro-*"
+      - ".opensearch-*"
+
+    cluster.routing.allocation.disk.threshold_enabled: true
+    cluster.routing.allocation.disk.watermark.low: 85%
+    cluster.routing.allocation.disk.watermark.high: 90%
+    cluster.routing.allocation.disk.watermark.flood_stage: 95%
+
+    action.auto_create_index: true
+    indices.query.bool.max_clause_count: 10000
+
+# -----------------------------------------------------------------------
+# Security config bundle — dataComplete replaces the WHOLE
+# opensearch-security config directory with exactly these keys, so every
+# file the security plugin/securityadmin.sh expects must be listed here,
+# even the inert stubs (action_groups.yml/tenants.yml/nodes_dn.yml/
+# whitelist.yml) — omitting one does not fall back to the image's default,
+# it goes missing entirely.
+# -----------------------------------------------------------------------
+securityConfig:
+  enabled: true
+  config:
+    dataComplete: true
+    data:
+      config.yml: |
+        _meta:
+          type: "config"
+          config_version: 2
+
+        config:
+          dynamic:
+            # Multitenancy MUST be disabled here (security-plugin side), not
+            # just in opensearch_dashboards.yml — otherwise it defaults ON
+            # and users land in an empty PRIVATE tenant. The DPN dashboards
+            # live in the global tenant, so a private-tenant landing makes
+            # dpnreader see "Application Not Found" when opening a
+            # dashboard.
+            kibana:
+              multitenancy_enabled: false
+              server_username: kibanaserver
+              index: ".kibana"
+            http:
+              anonymous_auth_enabled: false
+              xff:
+                enabled: true
+                internalProxies: "127\\.0\\.0\\.1|10\\..*|192\\.168\\..*|172\\.(1[6-9]|2[0-9]|3[0-1])\\..*"
+            authc:
+              basic_internal_auth_domain:
+                description: "HTTP Basic auth against the internal users database"
+                http_enabled: true
+                transport_enabled: true
+                order: 0
+                http_authenticator:
+                  type: basic
+                  challenge: false
+                authentication_backend:
+                  type: intern
+              proxy_auth_domain:
+                description: "Trusted-header auth from oauth2-proxy-osd via OSD proxycache"
+                http_enabled: true
+                transport_enabled: false
+                order: 1
+                http_authenticator:
+                  type: proxy
+                  challenge: false
+                  config:
+                    user_header: "x-forwarded-user"
+                    roles_header: "x-forwarded-groups"
+                    roles_separator: ","
+                authentication_backend:
+                  type: noop
+              openid_auth_domain:
+                description: "Bearer-JWT auth for direct :9200 API clients (Keycloak)"
+                http_enabled: true
+                transport_enabled: false
+                order: 2
+                http_authenticator:
+                  type: openid
+                  challenge: false
+                  config:
+                    subject_key: preferred_username
+                    roles_key: roles
+                    jwks_uri: https://dpn-keycloak-service-lb.ns-dpn-01.svc.cluster.local:8443/realms/dpn-realm/protocol/openid-connect/certs
+                    openid_connect_idp:
+                      enable_ssl: true
+                      verify_hostnames: false
+                      pemtrustedcas_filepath: certs/ca.crt
+                authentication_backend:
+                  type: noop
+
+      # Passwords below are bcrypt hashes of the KC-OPENSEARCH-*-PASSWORD
+      # Key Vault secrets — one-way, safe to commit. The plaintext values
+      # are what OSD/data-prepper/the init jobs authenticate with, sourced
+      # from the same Key Vault entries via a dedicated SecretProviderClass
+      # (templates/opensearch-oidc-kv-secretproviderclass.yaml).
+      internal_users.yml: |
+        _meta:
+          type: "internalusers"
+          config_version: 2
+
+        admin:
+          # Regenerated with a shell-safe character set (no &/#/`/quotes) -
+          # the original contained "&", which the smoke test in
+          # opensearch-cd.yaml interpolates into a raw shell command; "&"
+          # backgrounds the truncated command and the URL runs as a second,
+          # invalid command ("sh: https://...: not found").
+          #
+          # Rotated 2026-09-24: the previous hash no longer matched what was
+          # in pdev's Key Vault (all 3 internal users were returning 401 -
+          # unrecoverable, since bcrypt hashes can't be reversed to confirm
+          # the old plaintext). New hash generated via this cluster's own
+          # plugins/opensearch-security/tools/hash.sh for guaranteed format
+          # compatibility. Only takes effect on a fresh security-index
+          # bootstrap (allow_default_init_securityindex) - already-running
+          # clusters keep whatever hash they loaded at their own first boot.
+          hash: "$2y$12$Am.Pl6QUNibsMeROgjAQ3u7BfRjX.tgvXyII5Yb2a3zSFEf022d7S"
+          reserved: true
+          backend_roles:
+            - "admin"
+          description: "securityadmin / superuser account"
+
+        kibanaserver:
+          # Rotated 2026-09-24 - see admin's comment above.
+          hash: "$2y$12$Aq0Y7a5cCyl5iItaPo.4.uYPn8PCRuZl8nDSMsvSdRLezIZGCOKBq"
+          reserved: true
+          description: "OpenSearch Dashboards backend service account"
+
+        datawriter:
+          # Rotated 2026-09-24 - see admin's comment above.
+          hash: "$2y$12$lPYONcBQzRDTGEz.bPd8vOVgT0f7w7a8lidpaRi0Y4BzMI7G.qz6S"
+          reserved: false
+          description: "Telemetry writers: data-prepper, init jobs"
+
+      roles.yml: |
+        _meta:
+          type: "roles"
+          config_version: 2
+
+        dpn_readonly:
+          reserved: false
+          description: "Read-only access to DPN telemetry indices and dashboards"
+          cluster_permissions:
+            - "cluster_composite_ops_ro"
+            - "cluster:monitor/*"
+            - "cluster:admin/opensearch/observability/get"
+            - "cluster:admin/opensearch/ql/datasources/read"
+            - "cluster:admin/opendistro/ism/policy/search"
+            - "cluster:admin/opendistro/ism/policy/get"
+          index_permissions:
+            - index_patterns:
+                - "*"
+              allowed_actions:
+                - "indices:admin/get"
+            - index_patterns:
+                - "otel-*"
+                - "otel-logs-*"
+              allowed_actions:
+                - "read"
+                - "search"
+                - "indices:monitor/*"
+            - index_patterns:
+                - ".kibana*"
+                - ".opensearch_dashboards*"
+              allowed_actions:
+                - "read"
+                - "search"
+                - "indices:monitor/*"
+      # No write grant on .kibana*/.opensearch_dashboards* for dpn_readonly:
+      # OpenSearch's security plugin unconditionally rejects the _update API
+      # (security_exception: "Update is not supported when FLS or DLS or
+      # Fieldmasking is activated") whenever a role has DLS on that index,
+      # regardless of whether the filter would match — so a DLS-scoped write
+      # (e.g. to just type:config, for OSD's per-user preferences) cannot
+      # work at all, it errors 500 on the first save attempt. And an
+      # unscoped write, without DLS, would let dpnreader create/edit/delete
+      # ANY .kibana document via the API — defeating read-only entirely.
+      # dpnreader is left strictly read-only: no per-user OSD preference
+      # persistence, but OSD's permission-denied handling for the resulting
+      # 403 is far more graceful than the 500 the DLS combo produced.
+
+      # dpnreader is deliberately NOT mapped to the reserved kibana_user
+      # role: that built-in role grants unrestricted CRUD on .kibana*,
+      # which would override dpn_readonly's read-only design —
+      # permissions from multiple mapped roles are additive, so a broader
+      # unscoped grant elsewhere defeats a narrower restriction.
+      roles_mapping.yml: |
+        _meta:
+          type: "rolesmapping"
+          config_version: 2
+
+        all_access:
+          reserved: false
+          backend_roles:
+            - "dpnadmin"
+          users:
+            - "admin"
+            - "kibanaserver"
+            - "datawriter"
+
+        kibana_read_only:
+          reserved: false
+          backend_roles:
+            - "dpnreader"
+
+        dpn_readonly:
+          reserved: false
+          backend_roles:
+            - "dpnreader"
+
+      action_groups.yml: |
+        _meta:
+          type: "actiongroups"
+          config_version: 2
+
+      tenants.yml: |
+        _meta:
+          type: "tenants"
+          config_version: 2
+
+      nodes_dn.yml: |
+        _meta:
+          type: "nodesdn"
+          config_version: 2
+
+      whitelist.yml: |
+        _meta:
+          type: "whitelist"
+          config_version: 2
+        config:
+          enabled: false
+
+extraVolumes:
+  - name: dpn-health-tls
+    secret:
+      secretName: dpn-health-tls
+  # Not read by OpenSearch itself — mounting it is what makes the CSI
+  # driver mirror the Key Vault values into the oidc-secrets Secret that
+  # OSD/data-prepper/the init jobs read via secretKeyRef. See
+  # templates/opensearch-oidc-kv-secretproviderclass.yaml.
+  - name: oidc-kv-secrets-store
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: dpn-opensearch-health-oidc-kv-secrets
+
+extraVolumeMounts:
+  - name: dpn-health-tls
+    mountPath: /usr/share/opensearch/config/certs
+    readOnly: true
+  - name: oidc-kv-secrets-store
+    mountPath: /mnt/oidc-secrets-store
+    readOnly: true
+
+# Same Key Vault this cluster already uses everywhere else (see
+# charts/oauth2-proxy/values.yaml's akv block) — used by
+# templates/opensearch-oidc-kv-secretproviderclass.yaml.
+opensearchOidc:
+  akv:
+    keyvaultName: <<your specific value>>
+    tenantId: <<your specific value>>
+    userAssignedIdentityID: <<your specific value>>
+
+service:
+  type: ClusterIP
+  httpPort: 9200
+  transportPort: 9300
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+antiAffinity: "soft"
+
+prometheus:
+  enabled: true

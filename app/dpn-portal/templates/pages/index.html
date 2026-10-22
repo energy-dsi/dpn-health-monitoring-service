@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+  {# Page header band #}
+  <div class="dpn-page-header">
+    <div class="dpn-page-header__inner">
+      <div class="dpn-page-header__lead">
+        <span class="dpn-page-header__avatar" aria-hidden="true">
+          {% include "icons/home.html" %}
+        </span>
+        <div>
+          <h1 class="dpn-page-header__title">DPN Home</h1>
+          {% if username %}
+          <p class="dpn-page-header__subtitle">Welcome, {{ username }} — every DPN service you have access to, in one place.</p>
+          {% else %}
+          <p class="dpn-page-header__subtitle">Every DPN service you have access to, in one place.</p>
+          {% endif %}
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="dpn-content">
+
+    {% if tiles %}
+
+    <section class="dpn-section" aria-label="Services">
+      <div class="dpn-tile-row">
+
+        {# Service group cards — header toggles the body open/closed #}
+        {% for tile in tiles %}
+        {% set icon_partial =
+          "icons/users.html" if tile.icon == "users" else
+          "icons/data.html" if tile.icon == "kafka" else
+          "icons/search.html" if tile.icon == "opensearch" else
+          "icons/activity.html" if tile.icon == "jaeger" else
+          "icons/gateway.html" if tile.icon == "gateway" else
+          "icons/security.html" if tile.icon == "security" else
+          "icons/health.html" if tile.icon == "health" else
+          "icons/app.html" %}
+
+        {% if tile.variant == "alt" %}
+        {# Flat CTA card - just one link out (e.g. the Keycloak admin
+           console), so it skips the expand/collapse and component-list
+           machinery the other cards use. #}
+        <section class="dpn-service-card dpn-service-card--alt">
+          <div class="dpn-service-card__top">
+            <span class="dpn-service-card__icon" aria-hidden="true">{% include icon_partial %}</span>
+            <span class="dpn-service-card__heading dpn-service-card__heading--static">
+              <span>
+                <span class="dpn-service-card__name">{{ tile.name }}</span>
+                {% if tile.subtitle %}
+                <span class="dpn-service-card__subname">{{ tile.subtitle }}</span>
+                {% endif %}
+              </span>
+            </span>
+          </div>
+          <p class="dpn-service-card__desc">{{ tile.description }}</p>
+          {% if tile.components and tile.components[0].url %}
+          <a class="dpn-service-card__cta" href="{{ tile.components[0].url }}" target="_blank" rel="noopener noreferrer">
+            <span>Go to {{ tile.name }}</span>
+            {% include "icons/arrow_right.html" %}
+          </a>
+          {% endif %}
+        </section>
+
+        {% else %}
+        <section class="dpn-service-card dpn-service-card--collapsed" data-card>
+          <button type="button" class="dpn-service-card__top" data-card-toggle
+                  aria-expanded="false" aria-controls="card-body-{{ loop.index }}">
+            <span class="dpn-service-card__icon" aria-hidden="true">{% include icon_partial %}</span>
+            <span class="dpn-service-card__heading">
+              <span>
+                <span class="dpn-service-card__name">{{ tile.name }}</span>
+                {% if tile.subtitle %}
+                <span class="dpn-service-card__subname">{{ tile.subtitle }}</span>
+                {% endif %}
+              </span>
+              <span class="dpn-service-card__chevron" aria-hidden="true">
+                {% include "icons/chevron.html" %}
+              </span>
+            </span>
+          </button>
+
+          {# The blurb stays outside the collapse wrapper - a collapsed card
+             still needs to say what it is. #}
+          <p class="dpn-service-card__desc">{{ tile.description }}</p>
+
+          <div class="dpn-service-card__collapse" id="card-body-{{ loop.index }}">
+            <div class="dpn-service-card__body">
+              {% if tile.components %}
+              <p class="dpn-service-card__components-label">Components ({{ tile.components|length }})</p>
+              <ul class="dpn-component-list">
+                {% for component in tile.components %}
+                <li style="--dpn-row: {{ loop.index0 }}">
+                  {# A component with no URL isn't reachable yet - render it as
+                     a plain row rather than a link that goes nowhere. #}
+                  {% if component.url %}
+                  <a class="dpn-component" href="{{ component.url }}" target="_blank" rel="noopener noreferrer">
+                    <span class="dpn-component__text">
+                      <span class="dpn-component__name">{{ component.name }}</span>
+                      {% if component.reachable %}
+                      <span class="dpn-component__status dpn-component__status--ok">
+                        <span class="dpn-component__dot" aria-hidden="true"></span>Normal Operations
+                      </span>
+                      {% else %}
+                      <span class="dpn-component__status dpn-component__status--none">
+                        <span class="dpn-component__dot" aria-hidden="true"></span>Unavailable
+                      </span>
+                      {% endif %}
+                    </span>
+                    <span class="dpn-component__arrow" aria-hidden="true">
+                      {% include "icons/arrow_right.html" %}
+                    </span>
+                  </a>
+                  {% else %}
+                  <span class="dpn-component dpn-component--inert">
+                    <span class="dpn-component__text">
+                      <span class="dpn-component__name">{{ component.name }}</span>
+                      <span class="dpn-component__status dpn-component__status--none">
+                        <span class="dpn-component__dot" aria-hidden="true"></span>No status available
+                      </span>
+                    </span>
+                  </span>
+                  {% endif %}
+                </li>
+                {% endfor %}
+              </ul>
+              {% endif %}
+            </div>
+          </div>
+        </section>
+        {% endif %}
+        {% endfor %}
+
+      </div>
+    </section>
+
+    {% else %}
+
+    {# Empty state #}
+    <div class="dpn-empty-state">
+      <div class="dpn-empty-state__icon">{% include "icons/warning.html" %}</div>
+      <h2 class="dpn-empty-state__title">No services available</h2>
+      <p class="dpn-empty-state__body">
+        No services are configured for your role. Contact your administrator.
+      </p>
+    </div>
+
+    {% endif %}
+
+  </div>{# /dpn-content #}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  /* Collapse/expand a service card. Everything is driven off the
+     --collapsed class - the chevron rotates and the body's grid row
+     animates from 1fr to 0fr (see style.css). */
+  document.querySelectorAll('[data-card-toggle]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var card = btn.closest('[data-card]');
+      var collapsed = card.classList.toggle('dpn-service-card--collapsed');
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    });
+  });
+</script>
+{% endblock %}

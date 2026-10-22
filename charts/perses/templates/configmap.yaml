@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dpn-perses
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: perses
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  config.yaml: |
+    api_prefix: ""
+
+    database:
+      file:
+        extension: json
+        folder: /data
+
+    frontend:
+      explorer:
+        enable: true
+
+    provisioning:
+      folders:
+        - /etc/perses/provisioning
+      interval: 10m
+
+    security:
+      enable_auth: false
+      authorization: {}
+      cookie:
+        same_site: lax
+        secure: false
+      readonly: false
