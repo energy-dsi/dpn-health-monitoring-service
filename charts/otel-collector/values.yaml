@@ -1,0 +1,334 @@
+# Namespace for deployment
+namespace: ns-dpn-health-01
+
+# Cluster name for resource attributes
+#clusterName: <<your specific value>>
+
+mode: deployment
+replicaCount: 1
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+  tag: 0.95.0
+  pullPolicy: IfNotPresent
+
+# ---------------------------------------------------------------------------
+# TLS for the OTLP receivers (:4317 gRPC, :4318 HTTP).
+#
+# Consumed by otel-collector-config.yaml (the receiver `tls:` blocks) and by
+# templates/deployment.yaml (the Secret volume mount). Because helm always
+# merges this file underneath any -f values-<env>.yaml, these defaults apply to
+# every environment unless that env's values file overrides them.
+#
+# secretName is an EXISTING kubernetes.io/tls Secret that this chart does not
+# create or own - the same dpn-health-tls Secret the oauth2-proxy releases
+# consume, so no new PKI is introduced. It must live in `namespace` below and
+# carry tls.crt + tls.key.
+#
+# Turning this on is a BREAKING change for producers: they have to move to
+# https:// (OTLP/HTTP) or a TLS gRPC channel and trust the DPN CA. Set
+# enabled=false (or --set tls.enabled=false) to serve plaintext again.
+# ---------------------------------------------------------------------------
+tls:
+  enabled: true
+  secretName: dpn-health-tls
+  mountPath: /tls
+  certFile: tls.crt
+  keyFile: tls.key
+  minVersion: "1.2"
+
+# ---------------------------------------------------------------------------
+# Keycloak (OIDC) authentication on the OTLP/HTTP receiver ONLY (:4318).
+#
+# Consumed by otel-collector-config.yaml (the `oidc` extension + the http
+# protocol's `auth: {authenticator: oidc}`). The gRPC receiver (:4317) is
+# deliberately left alone - it stays TLS-trusted-client-only, same as before
+# this was added. When enabled, every OTLP/HTTP export must carry a
+# Keycloak-issued Bearer access token whose `aud` claim matches `audience`
+# below - the same "prove it with a Keycloak token" posture oauth2-proxy uses
+# for browser logins (charts/oauth2-proxy/values.yaml's `keycloak:` block) and
+# utils/kafka_security.py's SASL_SSL+OAUTHBEARER uses for Kafka in
+# dpn-data-pipelines, applied here to telemetry ingestion.
+#
+# ON by default: with tls.enabled also true (above), a plaintext OR
+# unauthenticated call to :4318 is rejected outright - Keycloak is the only
+# way in on that port. This IS a breaking change for every existing
+# OTLP/HTTP producer: each one must be updated to fetch a client-credentials
+# token from Keycloak and attach it as "Authorization: Bearer <token>" before
+# this reaches an environment with real producers pointed at :4318. gRPC
+# producers (:4317) are unaffected. Set enabled=false to fall back to
+# TLS-trusted-client-only on :4318 too, same as before this was added.
+# ---------------------------------------------------------------------------
+keycloak:
+  enabled: true
+
+  # Same realm every other DPN service already authenticates against - see
+  # charts/oauth2-proxy/values.yaml's keycloak.internalUrl + realm: dpn-realm.
+  # Keycloak runs in ns-dpn-01, this collector in ns-dpn-health-01; the
+  # in-cluster LoadBalancer name resolves across namespaces (Services do,
+  # unlike Secrets - see charts/oauth2-proxy/values.yaml's header comment).
+  issuerUrl: "https://dpn-keycloak.ns-dpn-01.svc.cluster.local:8443/realms/dpn-realm"
+
+  # Reuses dpn-service-client - the same Keycloak client charts/oauth2-proxy
+  # already authenticates browser logins as (see its values.yaml keycloak.clientId)
+  # - as the audience OTLP producers must authenticate as too, rather than
+  # widening dpn-kafka-client's scope (utils/kafka_security.py's Kafka-only
+  # OAUTHBEARER client in dpn-data-pipelines) or minting a brand new client.
+  #
+  # Unlike reusing dpn-kafka-client, this is NOT already sitting in every
+  # producer/consumer/adaptor/schema_mapper pod: those pods hold a
+  # dpn-kafka-client secret for Kafka, not a dpn-service-client one, so each
+  # one still needs the dpn-service-client credential (client id + secret)
+  # distributed to it via a client-credentials grant before it can attach a
+  # Bearer token to its OTLP exports - the same akv/secretproviderclass
+  # pattern charts/oauth2-proxy/values.yaml's `akv:` block already uses to
+  # pull that same client's secret from AKV.
+  #
+  # REQUIRES a Keycloak-side change first: dpn-service-client's
+  # client-credentials access token must carry "dpn-service-client" in its
+  # `aud` claim (add an Audience protocol mapper on that client if its tokens
+  # currently only carry Keycloak's default `["account"]`) - otherwise the
+  # oidc extension rejects every token with "audience mismatch" even though
+  # it's genuinely valid.
+  audience: dpn-service-client
+
+  # Verifies Keycloak's own TLS certificate when the collector calls it for
+  # OIDC discovery/JWKS. Reuses the ca.crt already carried by the
+  # tls.secretName Secret above (the same DPN CA oauth2-proxy already trusts
+  # Keycloak with) - no separate Secret needed. This is why keycloak.enabled
+  # requires tls.enabled (otel-collector-config.yaml fails the template
+  # render otherwise).
+  issuerCaFile: ca.crt
+
+# NOTE: this `config:` tree is NOT consumed by anything - templates/configmap.yaml
+# builds the collector config from `tpl (.Files.Get "otel-collector-config.yaml")`,
+# and no template references .Values.config. It is kept only as the historical
+# record of the pipeline; the receiver TLS settings live in `tls:` above and in
+# otel-collector-config.yaml. Editing the block below has no effect.
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  
+  processors:
+    batch:
+      timeout: 10s
+      send_batch_size: 1024
+    
+    resource:
+      attributes:
+        - key: cluster
+          value: ${clusterName}
+          action: upsert
+    
+    probabilistic_sampler:
+      sampling_percentage: 10
+    
+    # Redact sensitive information from logs
+    redaction:
+      # Allow keys - these will NOT be redacted
+      allow_all_keys: false
+      # Blocked values - patterns to redact
+      blocked_values:
+        # API Keys and Tokens
+        - "(?i)(api[_-]?key|apikey)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{20,})['\"]?"
+        - "(?i)(access[_-]?token|accesstoken)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-\\.]{20,})['\"]?"
+        - "(?i)(bearer\\s+)([a-zA-Z0-9_\\-\\.]{20,})"
+        - "(?i)(token)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-\\.]{20,})['\"]?"
+        
+        # Passwords
+        - "(?i)(password|passwd|pwd)\\s*[:=]\\s*['\"]?([^\\s'\"]{8,})['\"]?"
+        - "(?i)(pass)\\s*[:=]\\s*['\"]?([^\\s'\"]{8,})['\"]?"
+        
+        # Secrets
+        - "(?i)(secret|secret[_-]?key)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{16,})['\"]?"
+        - "(?i)(client[_-]?secret)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{20,})['\"]?"
+        
+        # AWS Credentials
+        - "(?i)(aws[_-]?access[_-]?key[_-]?id)\\s*[:=]\\s*['\"]?(AKIA[0-9A-Z]{16})['\"]?"
+        - "(?i)(aws[_-]?secret[_-]?access[_-]?key)\\s*[:=]\\s*['\"]?([a-zA-Z0-9/+=]{40})['\"]?"
+        
+        # Private Keys
+        - "-----BEGIN\\s+(RSA|DSA|EC|OPENSSH|PGP)\\s+PRIVATE\\s+KEY-----[\\s\\S]*?-----END\\s+(RSA|DSA|EC|OPENSSH|PGP)\\s+PRIVATE\\s+KEY-----"
+        
+        # JWT Tokens
+        - "eyJ[a-zA-Z0-9_-]*\\.eyJ[a-zA-Z0-9_-]*\\.[a-zA-Z0-9_-]*"
+        
+        # Database Connection Strings
+        - "(?i)(mongodb|mysql|postgresql|postgres|redis)://[^\\s@]+:[^\\s@]+@[^\\s]+"
+        
+        # Credit Card Numbers (basic pattern)
+        - "\\b(?:\\d{4}[\\s-]?){3}\\d{4}\\b"
+        
+        # Email addresses in sensitive contexts
+        - "(?i)(email|e-mail)\\s*[:=]\\s*['\"]?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})['\"]?"
+        
+        # Authorization headers
+        - "(?i)(authorization)\\s*:\\s*['\"]?([^\\s'\"]+)['\"]?"
+        
+        # Generic sensitive patterns
+        - "(?i)(credentials?)\\s*[:=]\\s*['\"]?([^\\s'\"]{10,})['\"]?"
+        - "(?i)(auth)\\s*[:=]\\s*['\"]?([a-zA-Z0-9_\\-]{16,})['\"]?"
+      
+      # Summary of redaction - how to replace matched patterns
+      summary: debug
+  
+  exporters:
+    kafka/metrics:
+      brokers:
+        - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+      topic: otel-metrics
+      encoding: otlp_json
+      protocol_version: 2.0.0
+    
+    kafka/logs:
+      brokers:
+        - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+      topic: otel-logs
+      encoding: otlp_json
+      protocol_version: 2.0.0
+    
+    kafka/traces:
+      brokers:
+        - dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092
+      topic: otel-traces
+      encoding: otlp_proto
+      protocol_version: 2.0.0
+  
+  extensions:
+    # Serves the health endpoint on :13133 that the liveness/readiness probes
+    # hit. Without this nothing listens on 13133 -> probes fail -> CrashLoop.
+    health_check:
+      endpoint: 0.0.0.0:13133
+
+  service:
+    extensions: [health_check]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [batch, resource, probabilistic_sampler]
+        exporters: [kafka/traces]
+      
+      metrics:
+        receivers: [otlp]
+        processors: [batch, resource]
+        exporters: [kafka/metrics]
+      
+      logs:
+        receivers: [otlp]
+#        processors: [batch, resource]
+#        exporters: [kafka/logs]
+        processors: [resource, transform/logs_redaction]
+        exporters: [kafka/logs, logging]
+
+
+# Service configuration
+service:
+  # Service is named "dpn-otel-collector" so applications that send OTLP to that
+  # historical hostname (dpn-otel-collector.ns-dpn-health-01.svc.cluster.local)
+  # resolve. Deployment/ServiceAccount keep the -health fullname.
+  name: dpn-otel-collector
+  type: ClusterIP
+  ports:
+    otlp-grpc:
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    otlp-http:
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+    metrics:
+      port: 8888
+      targetPort: 8888
+      protocol: TCP
+    health:
+      port: 13133
+      targetPort: 13133
+      protocol: TCP
+
+# Resource limits and requests
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# Autoscaling configuration
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+# Service Account
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+
+
+# Health checks
+livenessProbe:
+  httpGet:
+    path: /
+    port: 13133
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: 13133
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+# Pod annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8888"
+  prometheus.io/path: "/metrics"
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity rules
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - otel-collector
+          topologyKey: kubernetes.io/hostname
+
+# Made with Bob

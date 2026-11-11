@@ -1,0 +1,46 @@
+# ===========================================================================
+# oauth2-proxy in front of dpn-portal, the tile landing page.
+#
+# NOT present in nginx-observability or the original eight releases: this UI
+# has no prior cluster port to inherit, since it only existed in
+# config/docker-compose.observability-full.yml before now. 8443 was chosen as
+# the portal's external-facing port — 5601, 8082, 16686, 9081, 9091, 8083,
+# 8086 and 8084 are all already taken by the other eight releases (see the
+# table in charts/oauth2-proxy/README.md).
+#
+# Only what genuinely differs per UI lives here — everything about Keycloak,
+# TLS and the session cookie policy is inherited from values.yaml.
+#
+# Deploy:
+#   helm upgrade --install dpn-oauth2-proxy-portal charts/oauth2-proxy \
+#     -n ns-dpn-health-01 -f charts/oauth2-proxy/values-portal.yaml
+#
+# Before the first login, https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8443/oauth2/callback must be a
+# registered redirect URI on the `oauth2-proxy` Keycloak client. See README.md.
+# ===========================================================================
+
+name: dpn-oauth2-proxy-portal
+
+# ClusterIP Service rendered by charts/dpn-portal. The trailing slash is
+# required by oauth2-proxy.
+upstream:
+  url: "http://dpn-portal.ns-dpn-health-01.svc.cluster.local:8000/"
+
+externalUrl: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:8443"
+
+# Distinct per UI: proxies sharing a hostname would otherwise overwrite each
+# other's session cookies.
+cookie:
+  name: _oauth2_proxy_portal
+
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  port: 8443
+  # Shared with every other proxy in this namespace. Kubernetes allows several
+  # Services on one address as long as no port collides.
+  loadBalancerIP: <<your specific value>>
+
+tlsSecretName: dpn-health-tls
+

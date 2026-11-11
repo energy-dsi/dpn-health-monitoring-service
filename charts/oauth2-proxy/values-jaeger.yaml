@@ -1,0 +1,42 @@
+# ===========================================================================
+# oauth2-proxy in front of the Jaeger query UI.
+#
+# Only what genuinely differs per UI lives here — everything about Keycloak,
+# TLS and the session cookie policy is inherited from values.yaml.
+#
+# Deploy:
+#   helm upgrade --install dpn-oauth2-proxy-jaeger charts/oauth2-proxy \
+#     -n ns-dpn-health-01 -f charts/oauth2-proxy/values-jaeger.yaml
+#
+# Before the first login, https://dpn-observability.ns-dpn-health-01.svc.cluster.local:16686/oauth2/callback must be a
+# registered redirect URI on the `oauth2-proxy` Keycloak client. See README.md.
+# ===========================================================================
+
+name: dpn-oauth2-proxy-jaeger
+
+# ClusterIP Service, reachable only from inside the namespace. The trailing
+# slash is required by oauth2-proxy.
+upstream:
+  url: "http://dpn-jaeger-query-health.ns-dpn-health-01.svc.cluster.local:16686/"
+
+# The namespace's single static internal LB IP, on the port nginx used to serve
+# this UI — so existing bookmarks keep working, with only the scheme changing
+# (http -> https) and the login changing from basic auth to Keycloak.
+externalUrl: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:16686"
+
+# Distinct per UI: proxies sharing a hostname would otherwise overwrite each
+# other's session cookies.
+cookie:
+  name: _oauth2_proxy_jaeger
+
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  port: 16686
+  # Shared with every other proxy in this namespace. Kubernetes allows several
+  # Services on one address as long as no port collides.
+  loadBalancerIP: <<your specific value>>
+
+tlsSecretName: dpn-health-tls
+

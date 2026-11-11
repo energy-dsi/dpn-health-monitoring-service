@@ -1,0 +1,17 @@
+# Per-cluster Key Vault + managed identity for the oauth2-proxy
+# SecretProviderClass. useVMManagedIdentity ties this to the AKS node pool's
+# identity, which is cluster-wide — the same identity every other
+# SecretProviderClass in this cluster (ns-dpn-01's keycloak/vault/certificate-
+# manager/federator-gateway charts) already uses.
+#
+# Confirmed live: every UI in ns-dpn-health-01 on this cluster shares this
+# one internal LB address (10.87.32.14, originally assigned to
+# dpn-oauth2-proxy-portal), differentiated by port only. Matches
+# charts/kafka-stack/values/azure/dev-dpn01.yaml, charts/prometheus/
+# values/azure/dev-dpn01.yaml and charts/thanos/values/azure/dev-dpn01.yaml.
+akv:
+  keyvaultName: <<your specific value>>
+  tenantId: "<<your specific value>>"
+  userAssignedIdentityID: "<<your specific value>>"
+service:
+  loadBalancerIP: <<your specific value>>

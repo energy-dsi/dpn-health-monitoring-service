@@ -1,0 +1,7 @@
+# Confirmed live: shares the same internal LB address as every other UI in
+# ns-dpn-health-01 on this cluster (10.87.32.14, originally assigned to
+# dpn-oauth2-proxy-portal), differentiated by port only. Matches
+# charts/oauth2-proxy/values/azure/dev-dpn01.yaml, charts/kafka-stack/
+# values/azure/dev-dpn01.yaml and charts/thanos/values/azure/dev-dpn01.yaml.
+prometheusHealthUi:
+  loadBalancerIP: <<your specific value>>

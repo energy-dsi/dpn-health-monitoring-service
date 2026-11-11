@@ -1,0 +1,386 @@
+
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dpn-opensearch-health-ui
+  namespace: ns-dpn-health-01
+  labels:
+    app.kubernetes.io/name: opensearch
+    app.kubernetes.io/component: health-ui
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: dpn-opensearch
+    app.kubernetes.io/name: opensearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: 9200
+      protocol: TCP
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dpn-opensearch-init-health
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-init-health
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: dpn-opensearch-init-health
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: opensearch-init-health
+          image: curlimages/curl:8.8.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            # Security plugin enabled: OpenSearch now serves HTTPS and
+            # requires the datawriter service account (all_access via
+            # roles_mapping.yml). --insecure because dpn-health-tls's SAN
+            # does not cover dpn-opensearch-health.
+            - name: DATAWRITER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dpn-opensearch-health-oidc-secrets
+                  key: datawriter-password
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              CURL="curl --insecure -u datawriter:${DATAWRITER_PASSWORD}"
+              echo "Waiting for OpenSearch health endpoint..."
+
+              until $CURL -fsS https://dpn-opensearch-health:9200/_cluster/health; do
+                echo "OpenSearch not ready yet..."
+                sleep 10
+              done
+
+              echo "Creating OTEL logs index template..."
+
+              $CURL -fsS -X PUT "https://dpn-opensearch-health:9200/_index_template/otel-logs-template" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "index_patterns": ["otel-logs-*"],
+                  "priority": 10,
+                  "template": {
+                    "settings": {
+                      "index": {
+                        "number_of_replicas": "0"
+                      }
+                    },
+                    "mappings": {
+                      "date_detection": false,
+                      "properties": {
+                        "@timestamp": {
+                          "type": "date"
+                        },
+                        "message": {
+                          "type": "text",
+                          "fields": {
+                            "keyword": {
+                              "type": "keyword",
+                              "ignore_above": 2048
+                            }
+                          }
+                        }
+                      },
+                      "dynamic_templates": [
+                        {
+                          "strings_as_keyword": {
+                            "match_mapping_type": "string",
+                            "mapping": {
+                              "type": "keyword",
+                              "ignore_above": 1024
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }'
+
+              echo "Creating OTEL traces index template..."
+
+              # Guards against the same field-explosion class of failure the
+              # otel-logs-template above already prevents: with a sane number
+              # of span/resource attribute keys (now that
+              # charts/otel-collector's kafka/traces exporter emits otlp_json
+              # instead of jaeger_proto - see that chart's
+              # otel-collector-config.yaml), total_fields.limit's default
+              # (1000, already raised once to 4000) should never realistically
+              # be approached, but this raises the ceiling further as cheap
+              # insurance, and strings_as_keyword keeps each string attribute
+              # to one mapped field instead of a text+keyword pair.
+              $CURL -fsS -X PUT "https://dpn-opensearch-health:9200/_index_template/otel-traces-template" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "index_patterns": ["otel-traces-*"],
+                  "priority": 10,
+                  "template": {
+                    "settings": {
+                      "index": {
+                        "number_of_replicas": "0",
+                        "mapping": {
+                          "total_fields": {
+                            "limit": "20000"
+                          }
+                        }
+                      }
+                    },
+                    "mappings": {
+                      "date_detection": false,
+                      "dynamic_templates": [
+                        {
+                          "strings_as_keyword": {
+                            "match_mapping_type": "string",
+                            "mapping": {
+                              "type": "keyword",
+                              "ignore_above": 1024
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }'
+
+              echo "OpenSearch init completed successfully."
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dpn-opensearch-alerting-init
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-alerting-init
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: dpn-opensearch-alerting-init
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: opensearch-alerting-init
+          image: curlimages/curl:8.8.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: DATAWRITER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dpn-opensearch-health-oidc-secrets
+                  key: datawriter-password
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              CURL="curl --insecure -u datawriter:${DATAWRITER_PASSWORD}"
+              echo "Waiting for OpenSearch before alerting init..."
+
+              until $CURL -fsS https://dpn-opensearch-health:9200/_cluster/health; do
+                echo "OpenSearch not ready yet..."
+                sleep 10
+              done
+
+              echo "Creating alerting placeholder index..."
+
+              $CURL -fsS -X PUT "https://dpn-opensearch-health:9200/dpn-alerting-init" \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "settings": {
+                    "index": {
+                      "number_of_replicas": 0
+                    }
+                  }
+                }' || true
+
+              echo "OpenSearch alerting init completed."
+
+---
+# OpenSearch Dashboards' own config file, replacing the previous all-env-var
+# setup now that the OpenSearch backend has security enabled. See
+# config/opensearch/opensearch_dashboards.yml for the reference this mirrors —
+# OSD itself still stays plain HTTP internally (oauth2-proxy-osd terminates
+# TLS and the Keycloak login in front of it); only its own connection to the
+# OpenSearch backend switches to HTTPS + the kibanaserver service account.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dpn-opensearch-dashboard-health-config
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-dashboard-health
+data:
+  opensearch_dashboards.yml: |
+    server.host: "0.0.0.0"
+    server.name: "dpn-opensearch-dashboards"
+
+    opensearch.hosts: ["https://dpn-opensearch-health:9200"]
+    opensearch.ssl.verificationMode: none
+    opensearch.username: "kibanaserver"
+    opensearch.password: "${OPENSEARCH_PASSWORD}"
+    opensearch.requestHeadersAllowlist:
+      - "securitytenant"
+      - "Authorization"
+      - "x-forwarded-for"
+      - "x-forwarded-user"
+      - "x-forwarded-groups"
+
+    opensearch_security.multitenancy.enabled: false
+    # dpnreader (backend role -> kibana_read_only) gets a genuine read-only UI.
+    opensearch_security.readonly_mode.roles: ["kibana_read_only"]
+
+    # Trusted-header (proxy) auth: OSD assumes oauth2-proxy-osd has
+    # authenticated the user and forwards the identity headers
+    # (x-forwarded-user / -groups / -for, all in requestHeadersAllowlist
+    # above) through to OpenSearch, whose proxy_auth_domain resolves the
+    # user + backend roles. OSD's own login flow is not used.
+    opensearch_security.auth.type: "proxy"
+    opensearch_security.proxycache.user_header: "x-forwarded-user"
+    opensearch_security.proxycache.roles_header: "x-forwarded-groups"
+    # Trust requests from any RFC-1918 address — in-cluster traffic (the
+    # oauth2-proxy-osd sidecar, the dashboard-init Job) arrives from pod IPs
+    # in these ranges, not from loopback.
+    opensearch_security.proxycache.proxy_header_ip: "127.0.0.1|172.16.0.0/12|10.0.0.0/8|192.168.0.0/16"
+
+    # OSD runs plain HTTP behind the proxy, so its own session cookie is not
+    # marked Secure (the browser-facing TLS is terminated by
+    # oauth2-proxy-osd on :5601).
+    opensearch_security.cookie.secure: false
+
+    # Kubernetes' readiness/liveness probes hit this pod directly, with none
+    # of the x-forwarded-* headers proxy auth requires — without this
+    # exemption every probe gets 401, the pod never becomes Ready, and the
+    # rollout never replaces the old one.
+    opensearch_security.auth.unauthenticated_routes: ["/api/status"]
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dpn-opensearch-dashboard-health
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-dashboard-health
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dpn-opensearch-dashboard-health
+  template:
+    metadata:
+      labels:
+        app: dpn-opensearch-dashboard-health
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: opensearch-dashboards
+          image: opensearchproject/opensearch-dashboards:2.11.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: OPENSEARCH_DASHBOARDS_DATEFORMAT_TZ
+              value: "UTC"
+            # Resolves ${OPENSEARCH_PASSWORD} in the mounted
+            # opensearch_dashboards.yml above — OSD's config loader supports
+            # env-var substitution the same way Kibana's does.
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dpn-opensearch-health-oidc-secrets
+                  key: kibanaserver-password
+          ports:
+            - name: http
+              containerPort: 5601
+          volumeMounts:
+            - name: osd-config
+              mountPath: /usr/share/opensearch-dashboards/config/opensearch_dashboards.yml
+              subPath: opensearch_dashboards.yml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 5601
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 5601
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: osd-config
+          configMap:
+            name: dpn-opensearch-dashboard-health-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dpn-opensearch-dashboard-health
+  namespace: ns-dpn-health-01
+  labels:
+    app: dpn-opensearch-dashboard-health
+spec:
+  type: ClusterIP
+  selector:
+    app: dpn-opensearch-dashboard-health
+  ports:
+    - name: http
+      port: 5601
+      targetPort: 5601
+      protocol: TCP

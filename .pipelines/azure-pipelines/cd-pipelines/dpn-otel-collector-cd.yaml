@@ -1,0 +1,229 @@
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+- name: imageTag
+  type: string
+  default: "0.95.0"
+
+jobs:
+- job: DeployOTel
+  displayName: Deploy OTel Collector Health
+  steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Deploy OTel Collector Health
+    inputs:
+      azureSubscription: ${{ parameters.ServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+
+        if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+          echo "ERROR: Environment '${{ parameters.environment }}' is configured for a single-DPN deployment and does not support cluster '${{ parameters.cluster }}'."
+          exit 1
+        fi
+
+        CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+        CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+        HELM_DIR="$(Build.SourcesDirectory)/charts/otel-collector"
+        VALUES_FILE="$(Build.SourcesDirectory)/charts/otel-collector/values-${{ parameters.environment }}.yaml"
+        VALUES_FILE_CLUSTER="$(Build.SourcesDirectory)/charts/otel-collector/values-${{ parameters.environment }}-${{ parameters.cluster }}.yaml"
+        RELEASE_NAME="dpn-otel-collector-health"
+        FULLNAME_OVERRIDE="dpn-otel-collector-health"
+
+        echo "CONFIG_FILE=$CONFIG_FILE"
+        echo "HELM_DIR=$HELM_DIR"
+        echo "VALUES_FILE=$VALUES_FILE"
+        echo "RELEASE_NAME=$RELEASE_NAME"
+        echo "FULLNAME_OVERRIDE=$FULLNAME_OVERRIDE"
+
+        if [ ! -f "$CONFIG_FILE" ]; then
+          if [ -f "$CONFIG_FILE_CLUSTER" ]; then
+            CONFIG_FILE="$CONFIG_FILE_CLUSTER"
+          else
+            echo "Config file missing: $CONFIG_FILE"
+            exit 1
+          fi
+        fi
+
+        if [ ! -f "$VALUES_FILE" ]; then
+          if [ -f "$VALUES_FILE_CLUSTER" ]; then
+            VALUES_FILE="$VALUES_FILE_CLUSTER"
+          fi
+        fi
+
+        if [ ! -d "$HELM_DIR" ]; then
+          echo "OTel chart directory missing: $HELM_DIR"
+          exit 1
+        fi
+
+        if [ ! -f "$HELM_DIR/Chart.yaml" ]; then
+          echo "OTel Chart.yaml missing: $HELM_DIR/Chart.yaml"
+          exit 1
+        fi
+
+        if [ ! -d "$HELM_DIR/templates" ]; then
+          echo "OTel templates directory missing: $HELM_DIR/templates"
+          exit 1
+        fi
+
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "OTel values file missing: $VALUES_FILE"
+          exit 1
+        fi
+
+        export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+        echo "RESOURCE_GROUP=$RESOURCE_GROUP"
+        echo "AKS_CLUSTER=$AKS_CLUSTER"
+        echo "NAMESPACE=$NAMESPACE"
+
+        az aks install-cli --kubelogin-version v0.2.19
+
+        az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+        az aks get-credentials \
+          --resource-group "$RESOURCE_GROUP" \
+          --name "$AKS_CLUSTER" \
+          --overwrite-existing
+
+        kubelogin convert-kubeconfig -l azurecli
+
+        echo "Checking namespace..."
+        kubectl get namespace "$NAMESPACE"
+
+        echo "========================================"
+        echo "Checking OTel dependencies..."
+        echo "========================================"
+
+        echo "Checking Kafka service..."
+        kubectl get svc dpn-kafka-health -n "$NAMESPACE"
+
+        echo "Checking Kafka endpoints..."
+        if ! kubectl get endpoints dpn-kafka-health -n "$NAMESPACE" | grep -q ":9092"; then
+          echo "Kafka endpoint dpn-kafka-health does not have ready backend on port 9092"
+          kubectl get endpoints dpn-kafka-health -n "$NAMESPACE" || true
+          exit 1
+        fi
+
+        echo "========================================"
+        echo "Linting OTel chart..."
+        echo "========================================"
+
+        helm lint "$HELM_DIR" \
+          -f "$VALUES_FILE" \
+          --set fullnameOverride="$FULLNAME_OVERRIDE" \
+          --set kafka.enabled=false \
+          --set image.tag="${{ parameters.imageTag }}" \
+          --set namespace="$NAMESPACE" \
+          --set clusterName="$AKS_CLUSTER" \
+          --debug
+
+        echo "========================================"
+        echo "Rendering OTel chart..."
+        echo "========================================"
+
+        helm template "$RELEASE_NAME" "$HELM_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          --set fullnameOverride="$FULLNAME_OVERRIDE" \
+          --set kafka.enabled=false \
+          --set image.tag="${{ parameters.imageTag }}" \
+          --set namespace="$NAMESPACE" \
+          --set clusterName="$AKS_CLUSTER" \
+          --debug > /tmp/otel-rendered.yaml
+
+        echo "Rendered resource kinds:"
+        grep "^kind:" /tmp/otel-rendered.yaml || true
+
+        echo "Checking rendered OTel name..."
+        grep -n "name: dpn-otel-collector-health" /tmp/otel-rendered.yaml || true
+
+        echo "Checking Kafka broker reference..."
+        grep -n "dpn-kafka-health.ns-dpn-health-01.svc.cluster.local:9092" /tmp/otel-rendered.yaml || true
+
+        echo "Ensuring Kafka/Zookeeper are NOT rendered by OTel health deployment..."
+        if grep -q "name: dpn-kafka-health$" /tmp/otel-rendered.yaml; then
+          echo "ERROR: Kafka broker resource rendered inside OTel health deployment."
+          echo "Set kafka.enabled=false or remove Kafka templates from this release."
+          exit 1
+        fi
+
+        if grep -q "name: dpn-zookeeper-health$" /tmp/otel-rendered.yaml; then
+          echo "ERROR: Zookeeper resource rendered inside OTel health deployment."
+          echo "Set kafka.enabled=false or remove Zookeeper templates from this release."
+          exit 1
+        fi
+
+        echo "========================================"
+        echo "Deploying OTel Collector Health..."
+        echo "========================================"
+
+        helm upgrade --install "$RELEASE_NAME" "$HELM_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          --set fullnameOverride="$FULLNAME_OVERRIDE" \
+          --set kafka.enabled=false \
+          --set image.tag="${{ parameters.imageTag }}" \
+          --set namespace="$NAMESPACE" \
+          --set clusterName="$AKS_CLUSTER" \
+          --wait \
+          --timeout 10m \
+          --debug
+
+        echo "========================================"
+        echo "Waiting for OTel rollout..."
+        echo "========================================"
+
+        kubectl rollout status deployment/dpn-otel-collector-health \
+          -n "$NAMESPACE" \
+          --timeout=300s
+
+        echo "========================================"
+        echo "OTel resources:"
+        echo "========================================"
+
+        kubectl get pods -n "$NAMESPACE" | grep otel || true
+        kubectl get svc -n "$NAMESPACE" | grep otel || true
+        kubectl get endpoints -n "$NAMESPACE" | grep otel || true
+        kubectl get deploy -n "$NAMESPACE" | grep otel || true
+

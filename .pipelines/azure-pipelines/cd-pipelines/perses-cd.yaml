@@ -1,0 +1,373 @@
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+    
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+jobs:
+- job: DeployPerses
+  displayName: Deploy Perses
+  steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Deploy Perses
+    inputs:
+      azureSubscription: ${{ parameters.ServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+
+        if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+          echo "ERROR: Environment '${{ parameters.environment }}' is configured for a single-DPN deployment and does not support cluster '${{ parameters.cluster }}'."
+          exit 1
+        fi
+
+        CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+        CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+
+        RELEASE_NAME="dpn-perses"
+        CHART_DIR="$(Build.SourcesDirectory)/charts/perses"
+        VALUES_FILE="$CHART_DIR/values.yaml"
+
+        echo "CONFIG_FILE=$CONFIG_FILE"
+        echo "CHART_DIR=$CHART_DIR"
+        echo "VALUES_FILE=$VALUES_FILE"
+        echo "RELEASE_NAME=$RELEASE_NAME"
+
+        if [ ! -f "$CONFIG_FILE" ]; then
+          if [ -f "$CONFIG_FILE_CLUSTER" ]; then
+            CONFIG_FILE="$CONFIG_FILE_CLUSTER"
+          else
+            echo "Config file missing: $CONFIG_FILE"
+            exit 1
+          fi
+        fi
+
+        if [ ! -d "$CHART_DIR" ]; then
+          echo "Perses chart directory missing: $CHART_DIR"
+          exit 1
+        fi
+
+        if [ ! -f "$CHART_DIR/Chart.yaml" ]; then
+          echo "Perses Chart.yaml missing: $CHART_DIR/Chart.yaml"
+          exit 1
+        fi
+
+        if [ ! -d "$CHART_DIR/templates" ]; then
+          echo "Perses templates directory missing: $CHART_DIR/templates"
+          exit 1
+        fi
+
+        if [ ! -f "$CHART_DIR/templates/service.yaml" ]; then
+          echo "Perses service template missing: $CHART_DIR/templates/service.yaml"
+          exit 1
+        fi
+
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "Perses values file missing: $VALUES_FILE"
+          exit 1
+        fi
+
+        export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+        echo "RESOURCE_GROUP=$RESOURCE_GROUP"
+        echo "AKS_CLUSTER=$AKS_CLUSTER"
+        echo "NAMESPACE=$NAMESPACE"
+
+        az aks install-cli --kubelogin-version v0.2.19
+
+        az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+        az aks get-credentials \
+          --resource-group "$RESOURCE_GROUP" \
+          --name "$AKS_CLUSTER" \
+          --overwrite-existing
+
+        kubelogin convert-kubeconfig -l azurecli
+
+        echo "Checking namespace..."
+        kubectl get namespace "$NAMESPACE"
+
+        echo "========================================"
+        echo "Linting Perses chart"
+        echo "========================================"
+
+        helm lint "$CHART_DIR" -f "$VALUES_FILE"
+
+        echo "========================================"
+        echo "Rendering Perses chart"
+        echo "========================================"
+
+        helm template "$RELEASE_NAME" "$CHART_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          --debug > /tmp/perses-rendered.yaml
+
+        echo "Rendered Perses resource kinds:"
+        grep "^kind:" /tmp/perses-rendered.yaml || true
+
+        echo "========================================"
+        echo "Checking rendered Perses service names"
+        echo "========================================"
+
+        echo "Expected service:"
+        grep -nE "^[[:space:]]*name:[[:space:]]*\"?dpn-perses-health\"?[[:space:]]*$" /tmp/perses-rendered.yaml || true
+
+        # Extract metadata.name for Service resources ONLY. The previous
+        # check grepped every "name: dpn-perses" in the manifest, which
+        # wrongly matched the ConfigMap and Deployment — both legitimately
+        # named after the release (dpn-perses), and the Deployment name is
+        # required as-is by the rollout-status step further below. We only
+        # care that the Services are named correctly here.
+        SERVICE_NAMES="$(awk '
+          /^kind: Service$/ { in_svc=1; next }
+          /^kind: / { in_svc=0 }
+          in_svc && /^[[:space:]]*name:[[:space:]]*/ {
+            line=$0
+            sub(/^[[:space:]]*name:[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            gsub(/"/, "", line)   # service.yaml renders name via | quote, so strip the quotes
+            print line
+          }
+        ' /tmp/perses-rendered.yaml)"
+
+        echo "Rendered Service names:"
+        echo "$SERVICE_NAMES"
+
+        if ! echo "$SERVICE_NAMES" | grep -qx "dpn-perses-health"; then
+          echo "ERROR: Service dpn-perses-health is not rendered."
+          echo "Check charts/perses/templates/service.yaml and charts/perses/values.yaml."
+          exit 1
+        fi
+
+        if echo "$SERVICE_NAMES" | grep -qx "dpn-perses"; then
+          echo "ERROR: Old Service name dpn-perses is still rendered."
+          echo "Update charts/perses/templates/service.yaml to create dpn-perses-health instead."
+          exit 1
+        fi
+
+        echo "Perses rendered service name validation passed."
+
+        echo "========================================"
+        echo "Rendered Perses Service names"
+        echo "========================================"
+
+        awk '
+          /^kind: Service$/ { in_svc=1 }
+          /^kind: / && $0 !~ /^kind: Service$/ { in_svc=0 }
+          in_svc && /^[[:space:]]*name:/ { print NR ":" $0 }
+        ' /tmp/perses-rendered.yaml || true
+
+        echo "========================================"
+        echo "Checking Helm release status"
+        echo "========================================"
+
+        HELM_STATUS="$(helm status "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null | jq -r '.info.status' || echo not-found)"
+        echo "Current Helm status: $HELM_STATUS"
+
+        if echo "$HELM_STATUS" | grep -q "pending"; then
+          echo "Helm release $RELEASE_NAME is stuck in $HELM_STATUS."
+
+          echo "Helm history:"
+          helm history "$RELEASE_NAME" -n "$NAMESPACE" || true
+
+          LAST_DEPLOYED_REVISION="$(helm history "$RELEASE_NAME" -n "$NAMESPACE" -o json 2>/dev/null \
+            | jq -r '[.[] | select(.status=="deployed")] | last | .revision // empty')"
+
+          if [ -n "$LAST_DEPLOYED_REVISION" ]; then
+            echo "Rolling back to last deployed revision: $LAST_DEPLOYED_REVISION"
+
+            helm rollback "$RELEASE_NAME" "$LAST_DEPLOYED_REVISION" \
+              -n "$NAMESPACE" \
+              --wait \
+              --timeout 5m || true
+          else
+            echo "No deployed revision found. Attempting uninstall."
+
+            helm uninstall "$RELEASE_NAME" \
+              -n "$NAMESPACE" \
+              --wait \
+              --timeout 5m || true
+
+            PENDING_SECRET="$(kubectl get secret -n "$NAMESPACE" \
+              -l owner=helm,name="$RELEASE_NAME" \
+              -o json 2>/dev/null \
+              | jq -r '.items[].metadata.name' \
+              | sort -V \
+              | tail -1 || true)"
+
+            if [ -n "$PENDING_SECRET" ]; then
+              echo "Deleting pending Helm secret: $PENDING_SECRET"
+              kubectl delete secret "$PENDING_SECRET" -n "$NAMESPACE" || true
+            fi
+          fi
+        fi
+
+        echo "========================================"
+        echo "Cleaning conflicting non-Helm Perses services"
+        echo "========================================"
+
+        delete_if_not_helm_owned() {
+          KIND="$1"
+          NAME="$2"
+
+          if kubectl get "$KIND" "$NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+            MANAGED_BY="$(kubectl get "$KIND" "$NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || true)"
+            RELEASE_ANNOTATION="$(kubectl get "$KIND" "$NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null || true)"
+
+            if [ "$MANAGED_BY" = "Helm" ] && [ "$RELEASE_ANNOTATION" = "$RELEASE_NAME" ]; then
+              echo "$KIND/$NAME is already Helm-owned by $RELEASE_NAME. Keeping it."
+            else
+              echo "$KIND/$NAME exists but is not Helm-owned by $RELEASE_NAME. Deleting it."
+              kubectl delete "$KIND" "$NAME" -n "$NAMESPACE" --ignore-not-found
+            fi
+          else
+            echo "$KIND/$NAME not found. Nothing to clean."
+          fi
+        }
+
+        # Delete only if manually created or owned by a different release.
+        delete_if_not_helm_owned service dpn-perses-health
+
+        # Remove old service if present.
+        delete_if_not_helm_owned service dpn-perses
+
+        echo "========================================"
+        echo "Deploying Perses"
+        echo "========================================"
+
+
+        helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          --wait \
+          --timeout 10m \
+          --atomic \
+          --debug
+
+        echo "========================================"
+        echo "Cleaning old Perses service after Helm deployment"
+        echo "========================================"
+
+        kubectl delete svc dpn-perses \
+          -n "$NAMESPACE" \
+          --ignore-not-found
+
+        echo "========================================"
+        echo "Waiting for Perses rollout"
+        echo "========================================"
+
+        # Perses is deployed as a Deployment (not a StatefulSet).
+        if kubectl get deployment dpn-perses -n "$NAMESPACE" >/dev/null 2>&1; then
+          kubectl rollout status deployment/dpn-perses \
+            -n "$NAMESPACE" \
+            --timeout=300s
+        else
+          echo "Deployment dpn-perses not found. Listing Perses workloads..."
+          kubectl get deployment,statefulset -n "$NAMESPACE" | grep perses || true
+          exit 1
+        fi
+
+        echo "========================================"
+        echo "Perses resources"
+        echo "========================================"
+
+        kubectl get pods -n "$NAMESPACE" | grep perses || true
+        kubectl get svc -n "$NAMESPACE" | grep perses || true
+        kubectl get sts -n "$NAMESPACE" | grep perses || true
+        kubectl get endpoints -n "$NAMESPACE" | grep perses || true
+        kubectl get endpointslice -n "$NAMESPACE" | grep perses || true
+
+        echo "========================================"
+        echo "Validating Perses health service"
+        echo "========================================"
+
+        kubectl get svc dpn-perses-health -n "$NAMESPACE"
+
+        PERSES_PORTS="$(kubectl get endpoints dpn-perses-health \
+          -n "$NAMESPACE" \
+          -o jsonpath='{.subsets[*].ports[*].port}' 2>/dev/null || true)"
+
+        echo "Perses endpoint ports: $PERSES_PORTS"
+
+        if ! echo "$PERSES_PORTS" | grep -wq "8080"; then
+          echo "dpn-perses-health has no ready backend on target port 8080"
+
+          kubectl get endpoints dpn-perses-health \
+            -n "$NAMESPACE" \
+            -o yaml || true
+
+          exit 1
+        fi
+
+        echo "Perses endpoint validation passed."
+
+        echo "========================================"
+        echo "Testing Perses service"
+        echo "========================================"
+
+        # --rm only cleans up on a clean exit; an interrupted prior run
+        # leaves the pod behind and this `kubectl run` fails with
+        # AlreadyExists. Delete any leftover before creating a new one.
+        kubectl delete pod perses-curl-test -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=60s
+
+        kubectl run perses-curl-test \
+          -n "$NAMESPACE" \
+          --image=curlimages/curl:8.8.0 \
+          --restart=Never \
+          --rm \
+          --attach \
+          --command -- sh -c "curl -fsS -I --max-time 10 http://dpn-perses-health:8083 || true"
+
+        echo "========================================"
+        echo "Perses logs"
+        echo "========================================"
+
+        kubectl logs -n "$NAMESPACE" \
+          -l app.kubernetes.io/name=perses \
+          --tail=100 || true
+
+        echo "========================================"
+        echo "Recent Perses events"
+        echo "========================================"
+
+        kubectl get events -n "$NAMESPACE" \
+          --sort-by=.metadata.creationTimestamp | grep -i perses | tail -30 || true
+
+        echo "Perses deployment completed."

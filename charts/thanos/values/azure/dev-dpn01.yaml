@@ -1,0 +1,52 @@
+# Self-contained (full) values for Thanos on azure/dev-dpn01, so it renders whether
+# or not the base values.yaml is also passed ahead of it by the CD workflow.
+#
+# Confirmed live: Thanos Query shares the same internal LB address as every
+# other UI in ns-dpn-health-01 on this cluster (10.87.32.14), differentiated by port
+# only. Matches charts/oauth2-proxy/values/azure/dev-dpn01.yaml and
+# charts/prometheus/values/azure/dev-dpn01.yaml.
+namespace: ns-dpn-health-01
+
+imagePullSecret: ghcr-pull-secret-new
+
+image:
+  repository: <<your specific value>>/thanos
+  tag: v0.34.0
+  pullPolicy: IfNotPresent
+
+query:
+  name: dpn-thanos-query-health
+  replicas: 1
+
+  httpPort: 9091
+  grpcPort: 10903
+
+  service:
+    # No OAuth2 gateway in front (Thanos Query is consumed through
+    # Perses/Grafana, not browsed directly) but still needs a route in from
+    # outside the cluster, so it publishes directly on an internal
+    # LoadBalancer.
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    loadBalancerIP: <<your specific value>>
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+sidecar:
+  serviceName: dpn-thanos-sidecar-health
+  externalName: dpn-prometheus-kube-promet-thanos-discovery.ns-dpn-health-01.svc.cluster.local
+  grpcPort: 10901
+  httpPort: 10902
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534

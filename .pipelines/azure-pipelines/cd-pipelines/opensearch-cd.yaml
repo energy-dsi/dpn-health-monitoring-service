@@ -1,0 +1,420 @@
+parameters:
+- name: ServiceConnection
+  type: string
+  default: sc-dpn-dev-001
+  values:
+    - sc-dpn-dev-001
+    - sc-dpn-dev-002
+    - sc-dpn-test-001
+    - sc-dpn-test-002
+    - sc-dpn-pdev-ppd-001
+    - sc-dpn-ptest-ppd-001
+    - sc-dpn-puat-ppd-001
+
+- name: environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - devtest
+    - test
+    - pdev
+    - ptest
+    - puat
+
+- name: cluster
+  type: string
+  default: dpn01
+  values:
+    - dpn01
+    - dpn02
+
+- name: approval_group
+  displayName: 'Approval Group'
+  type: string
+  default: dsi-dev
+  values:
+    - dsi-dev
+    - dsi-devtest
+    - dsi-ppd
+
+jobs:
+- job: DeployOpenSearch
+  displayName: Deploy OpenSearch
+  steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: Deploy OpenSearch
+    inputs:
+      azureSubscription: ${{ parameters.ServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+
+        if [[ "${{ parameters.environment }}" =~ ^(pdev|ptest|puat)$ ]] && [[ "${{ parameters.cluster }}" == "dpn02" ]]; then
+          echo "ERROR: Environment '${{ parameters.environment }}' is configured for a single-DPN deployment and does not support cluster '${{ parameters.cluster }}'."
+          exit 1
+        fi
+
+        CONFIG_FILE="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}.json"
+        CONFIG_FILE_CLUSTER="$(Build.SourcesDirectory)/.pipelines/azure-pipelines/config/${{ parameters.environment }}-${{ parameters.cluster }}.json"
+
+        HELM_DIR="$(Build.SourcesDirectory)/charts/opensearch"
+        #VALUES_FILE="$(Build.SourcesDirectory)/charts/opensearch/opensearch-community-values-${{ parameters.cluster }}.yaml"
+        VALUES_FILE="$(Build.SourcesDirectory)/charts/opensearch/opensearch-community-values.yaml"
+
+        DPN_RESOURCES_FILE="$(Build.SourcesDirectory)/charts/opensearch/opensearch-dpn-health-resources.yaml"
+
+        RELEASE_NAME="dpn-opensearch"
+
+        echo "CONFIG_FILE=$CONFIG_FILE"
+        echo "HELM_DIR=$HELM_DIR"
+        echo "VALUES_FILE=$VALUES_FILE"
+        echo "DPN_RESOURCES_FILE=$DPN_RESOURCES_FILE"
+        echo "RELEASE_NAME=$RELEASE_NAME"
+
+        if [ ! -f "$CONFIG_FILE" ]; then
+          if [ -f "$CONFIG_FILE_CLUSTER" ]; then
+            CONFIG_FILE="$CONFIG_FILE_CLUSTER"
+          else
+            echo "Config file missing: $CONFIG_FILE"
+            exit 1
+          fi
+        fi
+
+        if [ ! -d "$HELM_DIR" ]; then
+          echo "OpenSearch chart directory missing: $HELM_DIR"
+          exit 1
+        fi
+
+        if [ ! -f "$HELM_DIR/Chart.yaml" ]; then
+          echo "OpenSearch Chart.yaml missing: $HELM_DIR/Chart.yaml"
+          exit 1
+        fi
+
+        if [ ! -d "$HELM_DIR/templates" ]; then
+          echo "OpenSearch templates directory missing: $HELM_DIR/templates"
+          echo "This usually means the real OpenSearch chart was not vendored correctly."
+          exit 1
+        fi
+
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "OpenSearch values file missing: $VALUES_FILE"
+          exit 1
+        fi
+
+        if [ ! -f "$DPN_RESOURCES_FILE" ]; then
+          echo "OpenSearch DPN health resources file missing: $DPN_RESOURCES_FILE"
+          exit 1
+        fi
+
+        export $(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
+        echo "RESOURCE_GROUP=$RESOURCE_GROUP"
+        echo "AKS_CLUSTER=$AKS_CLUSTER"
+        echo "NAMESPACE=$NAMESPACE"
+
+        # opensearch-community-values.yaml hardcodes opensearchOidc.akv.keyvaultName
+        # and .userAssignedIdentityID to dev-dpn01's own Key Vault/identity - fine for
+        # dev-dpn01 since that's what those defaults point at, but every other
+        # environment's OpenSearch pod would otherwise try to mount secrets from
+        # dev-dpn01's vault using dev-dpn01's identity, which times out (no network
+        # path) then fails identity auth (identity not assigned to this cluster's
+        # nodes). Override both from this environment's config JSON, same pattern
+        # deploy-oauth2-proxy.sh already uses for akv.keyvaultName/userAssignedIdentityID.
+        HELM_SET=()
+        if [ -n "${KEY_VAULT_NAME:-}" ]; then
+          echo "KEY_VAULT_NAME=$KEY_VAULT_NAME (overrides opensearchOidc.akv.keyvaultName)"
+          HELM_SET+=(--set "opensearchOidc.akv.keyvaultName=$KEY_VAULT_NAME")
+        fi
+        if [ -n "${AKV_USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+          echo "AKV_USER_ASSIGNED_IDENTITY_ID=$AKV_USER_ASSIGNED_IDENTITY_ID (overrides opensearchOidc.akv.userAssignedIdentityID)"
+          HELM_SET+=(--set "opensearchOidc.akv.userAssignedIdentityID=$AKV_USER_ASSIGNED_IDENTITY_ID")
+        fi
+
+        az aks install-cli --kubelogin-version v0.2.19
+
+        az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+        az aks get-credentials \
+          --resource-group "$RESOURCE_GROUP" \
+          --name "$AKS_CLUSTER" \
+          --overwrite-existing
+
+        kubelogin convert-kubeconfig -l azurecli
+
+        echo "Checking namespace..."
+        kubectl get namespace "$NAMESPACE"
+
+        echo "========================================"
+        echo "Linting OpenSearch chart..."
+        echo "========================================"
+
+        helm lint "$HELM_DIR" -f "$VALUES_FILE"
+
+        echo "========================================"
+        echo "Rendering OpenSearch chart..."
+        echo "========================================"
+
+        helm template "$RELEASE_NAME" "$HELM_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          ${HELM_SET[@]+"${HELM_SET[@]}"} \
+          --debug > /tmp/opensearch-rendered.yaml
+
+        echo "Rendered OpenSearch resources:"
+        grep "^kind:" /tmp/opensearch-rendered.yaml || true
+
+        echo "Checking expected OpenSearch StatefulSet/service names..."
+        grep -n "name: dpn-opensearch-health" /tmp/opensearch-rendered.yaml || true
+        grep -n "name: dpn-opensearch-health-headless" /tmp/opensearch-rendered.yaml || true
+
+        echo "Checking security plugin disabled config..."
+        grep -n "plugins.security.disabled" /tmp/opensearch-rendered.yaml || true
+        grep -n "DISABLE_SECURITY_PLUGIN" /tmp/opensearch-rendered.yaml || true
+
+        echo "========================================"
+        echo "Deploying OpenSearch Helm chart..."
+        echo "========================================"
+
+        helm upgrade --install "$RELEASE_NAME" "$HELM_DIR" \
+          --namespace "$NAMESPACE" \
+          -f "$VALUES_FILE" \
+          ${HELM_SET[@]+"${HELM_SET[@]}"} \
+          --wait \
+          --timeout 20m \
+          --debug
+
+        echo "========================================"
+        echo "Waiting for OpenSearch StatefulSet rollout..."
+        echo "========================================"
+
+        kubectl rollout status statefulset/dpn-opensearch-health \
+          -n "$NAMESPACE" \
+          --timeout=900s
+
+        echo "========================================"
+        echo "Checking OpenSearch core endpoints..."
+        echo "========================================"
+
+        kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+        kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE"
+
+        # Verify port 9200 has a READY backend. Use jsonpath, NOT
+        # `grep :9200` on the table — kubectl truncates the ENDPOINTS
+        # column with "+ N more..." and can hide 9200, causing a false
+        # failure even when the port is healthy.
+        if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" \
+             -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "9200"; then
+          echo "OpenSearch core service has no ready backend on port 9200"
+          kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" -o wide || true
+          exit 1
+        fi
+
+        echo "========================================"
+        echo "Preparing DPN OpenSearch health resources..."
+        echo "========================================"
+
+        echo "Deleting completed init jobs so they can be recreated cleanly..."
+        kubectl delete job dpn-opensearch-init-health \
+          -n "$NAMESPACE" \
+          --ignore-not-found
+
+        kubectl delete job dpn-opensearch-alerting-init \
+          -n "$NAMESPACE" \
+          --ignore-not-found
+
+        echo "Applying DPN OpenSearch health resources..."
+        kubectl apply -f "$DPN_RESOURCES_FILE"
+
+        echo "========================================"
+        echo "Waiting for DPN OpenSearch dashboard rollout..."
+        echo "========================================"
+
+        kubectl rollout status deployment/dpn-opensearch-dashboard-health \
+          -n "$NAMESPACE" \
+          --timeout=300s
+
+        echo "========================================"
+        echo "Waiting for DPN OpenSearch init jobs..."
+        echo "========================================"
+
+        kubectl wait --for=condition=complete job/dpn-opensearch-init-health \
+          -n "$NAMESPACE" \
+          --timeout=300s
+
+        kubectl wait --for=condition=complete job/dpn-opensearch-alerting-init \
+          -n "$NAMESPACE" \
+          --timeout=300s
+
+        echo "========================================"
+        echo "OpenSearch resources:"
+        echo "========================================"
+
+        kubectl get pods -n "$NAMESPACE" | grep opensearch || true
+        kubectl get svc -n "$NAMESPACE" | grep opensearch || true
+        kubectl get pvc -n "$NAMESPACE" | grep opensearch || true
+        kubectl get statefulset -n "$NAMESPACE" | grep opensearch || true
+        kubectl get jobs -n "$NAMESPACE" | grep opensearch || true
+
+        echo "========================================"
+        echo "OpenSearch endpoints:"
+        echo "========================================"
+
+        kubectl get endpoints -n "$NAMESPACE" | grep opensearch || true
+
+        echo "========================================"
+        echo "Validating DPN OpenSearch services..."
+        echo "========================================"
+
+        kubectl get svc dpn-opensearch-health -n "$NAMESPACE"
+        kubectl get svc dpn-opensearch-health-ui -n "$NAMESPACE"
+        kubectl get svc dpn-opensearch-dashboard-health -n "$NAMESPACE"
+
+        # jsonpath checks (not `grep :port` on the truncated table output).
+        if ! kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" \
+             -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "9200"; then
+          echo "dpn-opensearch-health has no ready backend on port 9200"
+          kubectl get endpoints dpn-opensearch-health -n "$NAMESPACE" -o wide || true
+          exit 1
+        fi
+
+        if ! kubectl get endpoints dpn-opensearch-health-ui -n "$NAMESPACE" \
+             -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "9200"; then
+          echo "dpn-opensearch-health-ui has no ready backend on port 9200"
+          kubectl get endpoints dpn-opensearch-health-ui -n "$NAMESPACE" -o wide || true
+          exit 1
+        fi
+
+        if ! kubectl get endpoints dpn-opensearch-dashboard-health -n "$NAMESPACE" \
+             -o jsonpath='{.subsets[*].ports[*].port}' | tr ' ' '\n' | grep -qx "5601"; then
+          echo "dpn-opensearch-dashboard-health has no ready backend on port 5601"
+          kubectl get endpoints dpn-opensearch-dashboard-health -n "$NAMESPACE" -o wide || true
+          exit 1
+        fi
+
+        echo "========================================"
+        echo "Testing OpenSearch cluster health..."
+        echo "========================================"
+
+        # Security plugin enabled: OpenSearch now serves HTTPS and
+        # requires a credential. Uses datawriter (all_access via
+        # roles_mapping.yml, same as admin) rather than admin itself:
+        # admin is a reserved internal user, and this cluster's
+        # security index was bootstrapped once already, so admin's
+        # live password can only be changed via securityadmin.sh or
+        # the security REST API — datawriter avoids that entirely.
+        OS_DATAWRITER_PASSWORD=$(az keyvault secret show \
+          --vault-name "$KEY_VAULT_NAME" \
+          --name KC-OPENSEARCH-DATAWRITER-PASSWORD \
+          --query value -o tsv)
+        echo "##vso[task.setvariable variable=OS_DATAWRITER_PASSWORD;issecret=true]$OS_DATAWRITER_PASSWORD"
+
+        # Password passed as a pod env var rather than interpolated
+        # into the command text — safe regardless of what characters
+        # a future rotation puts in it (a literal "&" here previously
+        # backgrounded the command and left the URL to run on its own,
+        # "sh: https://...: not found").
+        kubectl run opensearch-curl-test \
+          -n "$NAMESPACE" \
+          --image=curlimages/curl:8.8.0 \
+          --restart=Never \
+          --rm \
+          --attach \
+          --env="OS_DATAWRITER_PASSWORD=$OS_DATAWRITER_PASSWORD" \
+          --command -- sh -c 'curl -fsS --insecure -u "datawriter:$OS_DATAWRITER_PASSWORD" https://dpn-opensearch-health:9200/_cluster/health'
+
+        echo "========================================"
+        echo "Pushing dpn_readonly role definition..."
+        echo "========================================"
+
+        # allow_default_init_securityindex only bootstraps the security
+        # index on a NEVER-initialized cluster, so a roles.yml edit made
+        # after that first boot needs to be re-applied explicitly.
+        # securityadmin.sh would be the normal way to do that, but it
+        # needs an mTLS admin client cert with the "TLS Web Client
+        # Authentication" EKU, which isn't available here (dpn-health-tls
+        # is server-only). dpn_readonly is not a reserved resource
+        # though, so it can be pushed directly via the REST API instead
+        # - idempotent, safe to run on every deploy.
+        kubectl run opensearch-role-push \
+          -n "$NAMESPACE" \
+          --image=curlimages/curl:8.8.0 \
+          --restart=Never \
+          --rm \
+          --attach \
+          --env="OS_DATAWRITER_PASSWORD=$OS_DATAWRITER_PASSWORD" \
+          --command -- sh -c 'curl -fsS --insecure -u "datawriter:$OS_DATAWRITER_PASSWORD" -X PUT "https://dpn-opensearch-health:9200/_plugins/_security/api/roles/dpn_readonly" -H "Content-Type: application/json" -d "{\"cluster_permissions\":[\"cluster_composite_ops_ro\",\"cluster:monitor/*\",\"cluster:admin/opensearch/observability/get\",\"cluster:admin/opensearch/ql/datasources/read\",\"cluster:admin/opendistro/ism/policy/search\",\"cluster:admin/opendistro/ism/policy/get\"],\"index_permissions\":[{\"index_patterns\":[\"otel-*\",\"otel-logs-*\"],\"allowed_actions\":[\"read\",\"search\",\"indices:monitor/*\"]},{\"index_patterns\":[\".kibana*\",\".opensearch_dashboards*\"],\"allowed_actions\":[\"read\",\"search\",\"indices:monitor/*\"]}]}"'
+
+        echo "========================================"
+        echo "Testing OpenSearch Dashboards endpoint..."
+        echo "========================================"
+
+        # /api/status is exempted from proxy-header auth
+        # (opensearch_security.auth.unauthenticated_routes) — every
+        # other path now 401s without x-forwarded-user/-groups.
+        kubectl run opensearch-dashboard-curl-test \
+          -n "$NAMESPACE" \
+          --image=curlimages/curl:8.8.0 \
+          --restart=Never \
+          --rm \
+          --attach \
+          --command -- sh -c "curl -I --max-time 10 http://dpn-opensearch-dashboard-health:5601/api/status || true"
+
+        echo "========================================"
+        echo "Provisioning DPN dashboard saved objects..."
+        echo "========================================"
+
+        DASHBOARD_PROVISIONING_DIR="$(Build.SourcesDirectory)/config/opensearch/dashboard-provisioning"
+        INDEX_TEMPLATE_FILE="$(Build.SourcesDirectory)/config/opensearch/otel-logs-index-template.json"
+        DASHBOARD_INIT_JOB_FILE="$(Build.SourcesDirectory)/charts/opensearch/dashboard-init-job.yaml"
+
+        if [ ! -f "$DASHBOARD_PROVISIONING_DIR/log-status-dashboard.ndjson" ]; then
+          echo "Dashboard ndjson missing: $DASHBOARD_PROVISIONING_DIR/log-status-dashboard.ndjson"
+          exit 1
+        fi
+
+        if [ ! -f "$INDEX_TEMPLATE_FILE" ]; then
+          echo "Index template missing: $INDEX_TEMPLATE_FILE"
+          exit 1
+        fi
+
+        if [ ! -f "$DASHBOARD_INIT_JOB_FILE" ]; then
+          echo "Dashboard init Job manifest missing: $DASHBOARD_INIT_JOB_FILE"
+          exit 1
+        fi
+
+        echo "Refreshing dashboard provisioning ConfigMap..."
+        kubectl create configmap dpn-dashboard-provisioning-files \
+          --from-file=log-status-dashboard.ndjson="$DASHBOARD_PROVISIONING_DIR/log-status-dashboard.ndjson" \
+          --from-file=otel-logs-index-template.json="$INDEX_TEMPLATE_FILE" \
+          --from-file=init-opensearch-dashboard.sh="$DASHBOARD_PROVISIONING_DIR/init-opensearch-dashboard.sh" \
+          -n "$NAMESPACE" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        echo "Deleting previous dashboard-init Job so it can be recreated cleanly..."
+        kubectl delete job dpn-dashboard-init \
+          -n "$NAMESPACE" \
+          --ignore-not-found
+
+        echo "Applying dashboard-init Job..."
+        kubectl apply -f "$DASHBOARD_INIT_JOB_FILE"
+
+        echo "Waiting for dashboard-init Job to complete..."
+        kubectl wait --for=condition=complete job/dpn-dashboard-init \
+          -n "$NAMESPACE" \
+          --timeout=300s
+
+        echo "Dashboard init Job logs:"
+        kubectl logs -n "$NAMESPACE" -l app=dpn-dashboard-init --tail=100
+
+        echo "========================================"
+        echo "Recent OpenSearch events:"
+        echo "========================================"
+
+        kubectl get events -n "$NAMESPACE" \
+          --sort-by=.metadata.creationTimestamp | grep -i opensearch | tail -30 || true
+
+        echo "OpenSearch deployment completed."

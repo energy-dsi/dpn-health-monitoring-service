@@ -1,0 +1,6 @@
+type: S3
+config:
+  bucket: "thanos-bucket name"
+  endpoint: "s3.eu-west-2.amazonaws.com"
+  region: "eu-west-2"
+  # No access keys: credentials come from IRSA (eks.amazonaws.com/role-arn on the Prometheus service account).

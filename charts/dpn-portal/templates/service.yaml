@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+spec:
+  # ClusterIP only. oauth2-proxy is what the browser reaches — this Service
+  # is upstream.url for charts/oauth2-proxy/values-portal.yaml and never
+  # needs a LoadBalancer of its own.
+  type: ClusterIP
+  selector:
+    app: {{ .Values.name }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kafka-stack
+description: DPN Kafka, Zookeeper and Kafka UI stack
+type: application
+version: 0.1.0
+appVersion: "7.5.3"

@@ -1,0 +1,272 @@
+# ============================================================================
+# DPN Health Monitoring — Uninstall (reverse of the master CD)
+# ============================================================================
+# Uninstalls Helm releases in this stack, in the exact REVERSE of the master-CD
+# order so dependents go before their dependencies:
+#
+#   Nginx -> OAuth2-Proxy -> Portal -> Redis-UI -> OTel -> Perses -> Jaeger
+#         -> DataPrepper -> Thanos -> Prometheus -> OpenSearch -> Kafka
+#
+# Helm-created resources are removed via `helm uninstall`. OpenSearch's raw
+# (non-Helm, kubectl-applied) resources -- the dashboard Deployment/Service/
+# ConfigMap, the init/alerting Jobs, and the dashboard provisioning ConfigMap
+# -- are NOT covered by any Helm release, so they are separately cleaned up
+# by a dedicated step below whenever componentType is 'opensearch' or 'all'.
+#
+# ----------------------------------------------------------------------------
+# DATA PERSISTENCY — which PVCs survive an uninstall
+# ----------------------------------------------------------------------------
+# `helm uninstall` never deletes StatefulSet volumes, so the DATA stores are
+# RETAINED and reattach on the next install:
+#   - OpenSearch  : dpn-opensearch-health-dpn-opensearch-health-0
+#   - Prometheus  : prometheus-dpn-prometheus-kube-promet-prometheus-db-*  (one per replica)
+#   - Alertmanager: alertmanager-dpn-prometheus-kube-promet-alertmanager-db-*  (one per replica)
+#
+# The Helm-templated PVCs (transient message buffer / dashboard state) ARE
+# removed by `helm uninstall`:
+#   - Kafka     : dpn-kafka-health-pvc
+#   - Zookeeper : dpn-zookeeper-health-pvc
+#   - Perses    : dpn-perses-data
+# (A clean Kafka/Zookeeper on the next install is desirable — it avoids a stale
+#  cluster-id mismatch. The namespace and manual dpn-nginx-basic-auth secret are
+#  never touched.)
+# ----------------------------------------------------------------------------
+
+name: DPN Uninstall - Health Monitoring
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select Environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - test
+
+      cluster:
+        description: "Choose DPN Cluster"
+        required: true
+        default: "dpn01"
+        type: choice
+        options:
+          - dpn01
+          - dpn02
+
+      cloud:
+        description: "Target Cloud Provider"
+        required: true
+        default: "azure"
+        type: choice
+        options:
+          - azure
+          - aws
+          - gcp
+
+      componentType:
+        description: "Select Component to Uninstall (or 'all' to tear down the whole stack, in safe reverse order)"
+        required: true
+        type: choice
+        options:
+          - all
+          - nginx
+          - oauth2-proxy
+          - portal
+          - redis-ui
+          - otel
+          - perses
+          - jaeger
+          - data-prepper
+          - thanos
+          - prometheus
+          - opensearch
+          - kafka
+
+      confirm:
+        description: 'Type the componentType value again to confirm (exact match, e.g. "kafka" or "all")'
+        required: true
+        type: string
+
+env:
+  PARAMETERS_FILE: .github/config/${{ inputs.cloud }}/${{ inputs.environment }}-${{ inputs.cluster }}.json
+  NAMESPACE: ns-dpn-health-01
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  uninstall:
+    name: Helm Uninstall - Health Monitoring
+    runs-on: [self-hosted, vmss]
+    environment: ${{ inputs.environment }}-${{ inputs.cluster }}
+    steps:
+      - name: Validate Confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm }}" != "${{ inputs.componentType }}" ]]; then
+            echo "ERROR: confirmation text '${{ inputs.confirm }}' does not match componentType '${{ inputs.componentType }}'."
+            echo "Aborting — nothing was touched."
+            exit 1
+          fi
+          echo "Confirmation matched. Proceeding with componentType=${{ inputs.componentType }}"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Read Deployment Config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PARAMETERS_FILE}" ]; then
+            echo "ERROR: ${PARAMETERS_FILE} not found!"
+            exit 1
+          fi
+
+          echo "Loading config from ${PARAMETERS_FILE}"
+          for key in $(jq -r 'keys_unsorted[]' "${PARAMETERS_FILE}"); do
+            if [[ "$key" == "NAMESPACE" ]]; then
+              echo "Skipping NAMESPACE from config file — this workflow uses the fixed namespace ns-dpn-health-01"
+              continue
+            fi
+            value=$(jq -r ".\"$key\"" "${PARAMETERS_FILE}")
+            echo "${key}<<EOF" >> "$GITHUB_ENV"
+            echo "${value}" >> "$GITHUB_ENV"
+            echo "EOF" >> "$GITHUB_ENV"
+            echo "Set ${key}"
+          done
+
+      - name: Pre-Uninstall Checklist
+        shell: bash
+        run: |
+          echo "CONFIRM BEFORE PROCEEDING:"
+          echo "1. Component: ${{ inputs.componentType }}"
+          echo "2. No dashboards/alerts actively depended on by other teams right now"
+          echo "3. Kafka topics for monitoring pipeline drained (if uninstalling kafka)"
+          echo "4. Backups/exports of dashboards or historical metrics taken if required"
+          echo "5. If componentType=all: this removes the ENTIRE monitoring stack in namespace ${{ env.NAMESPACE }}"
+          echo "6. Data PVCs (OpenSearch/Prometheus/Alertmanager) are RETAINED by helm uninstall and will reattach on next install"
+          echo "7. Kafka/Zookeeper/Perses PVCs ARE removed by helm uninstall (clean state on next install)"
+          echo "8. If componentType=opensearch or all: OpenSearch's raw (non-Helm) dashboard/init-job/configmap resources are ALSO deleted"
+
+      - name: Cloud Login
+        uses: ./.github/actions/cloud-login
+        with:
+          cloud: ${{ inputs.cloud }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-account-id: ${{ env.AWS_ACCOUNT_ID }}
+          eks-cluster: ${{ env.EKS_CLUSTER }}
+          gcp-project-id: ${{ env.GCP_PROJECT_ID }}
+          gcp-region: ${{ env.GCP_REGION }}
+          gke-cluster: ${{ env.GKE_CLUSTER }}
+          gcp-workload-identity-provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          gcp-service-account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          environment: ${{ inputs.environment }}
+          cluster: ${{ inputs.cluster }}
+
+      - name: Helm Uninstall
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "Target namespace for this run: $NAMESPACE"
+
+          # name | release — confirmed exact release names, REVERSE of master-CD order
+          COMPONENTS=(
+            "nginx|dpn-nginx-observability"
+            "oauth2-proxy|dpn-oauth2-proxy-jaeger"
+            "oauth2-proxy|dpn-oauth2-proxy-osd"
+            "oauth2-proxy|dpn-oauth2-proxy-perses"
+            "oauth2-proxy|dpn-oauth2-proxy-portal"
+            "portal|dpn-portal"
+            "redis-ui|dpn-redis-ui-health"
+            "otel|dpn-otel-collector-health"
+            "perses|dpn-perses"
+            "jaeger|dpn-jaeger"
+            "data-prepper|dpn-data-prepper"
+            "thanos|dpn-thanos"
+            "prometheus|dpn-prometheus"
+            "opensearch|dpn-opensearch"
+            "kafka|dpn-kafka-stack"
+          )
+
+          SELECTED="${{ inputs.componentType }}"
+
+          DONE=(); SKIPPED=(); FAILED=()
+
+          for c in "${COMPONENTS[@]}"; do
+            NAME="${c%%|*}"; RELEASE="${c##*|}"
+
+            if [[ "$SELECTED" != "all" && "$SELECTED" != "$NAME" ]]; then
+              continue
+            fi
+
+            echo ""
+            echo "======================================================================"
+            echo "helm uninstall  ->  $NAME  ($RELEASE)"
+            echo "======================================================================"
+
+            if ! helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+              echo "Release $RELEASE not installed in $NAMESPACE — skipping."
+              SKIPPED+=("$NAME")
+              continue
+            fi
+
+            if helm uninstall "$RELEASE" -n "$NAMESPACE" --wait --timeout 15m; then
+              DONE+=("$NAME")
+            else
+              echo "ERROR: uninstall of $RELEASE failed."
+              FAILED+=("$NAME")
+            fi
+          done
+
+          echo ""
+          echo "======================================================================"
+          echo "Uninstall summary (componentType=${SELECTED})"
+          echo "======================================================================"
+          echo "Uninstalled (${#DONE[@]}): ${DONE[*]:-none}"
+          echo "Skipped not-installed (${#SKIPPED[@]}): ${SKIPPED[*]:-none}"
+          echo "Retained data PVCs: OpenSearch / Prometheus / Alertmanager StatefulSet volumes."
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "Failed (${#FAILED[@]}): ${FAILED[*]}"
+            exit 1
+          fi
+          echo "Uninstall completed."
+
+      - name: Cleanup OpenSearch Raw (non-Helm) Resources
+        if: ${{ inputs.componentType == 'opensearch' || inputs.componentType == 'all' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "Deleting OpenSearch resources applied directly via kubectl (not Helm)..."
+
+          kubectl delete deployment dpn-opensearch-dashboard-health -n "$NAMESPACE" --ignore-not-found
+          kubectl delete service dpn-opensearch-dashboard-health dpn-opensearch-health-ui -n "$NAMESPACE" --ignore-not-found
+          kubectl delete configmap dpn-opensearch-dashboard-health-config dpn-dashboard-provisioning-files -n "$NAMESPACE" --ignore-not-found
+          kubectl delete job dpn-opensearch-init-health dpn-opensearch-alerting-init dpn-dashboard-init -n "$NAMESPACE" --ignore-not-found
+
+          echo "OpenSearch raw-resource cleanup complete."
+
+      - name: Verification
+        shell: bash
+        run: |
+          echo "Using namespace: $NAMESPACE"
+
+          echo "Deployments:"
+          kubectl get deployments -n "$NAMESPACE"
+
+          echo "Pods:"
+          kubectl get pods -n "$NAMESPACE"
+
+          echo "Helm Releases:"
+          helm list -n "$NAMESPACE"
+
+          echo "Services preserved:"
+          kubectl get svc -n "$NAMESPACE"

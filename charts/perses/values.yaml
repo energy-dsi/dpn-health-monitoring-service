@@ -1,0 +1,30 @@
+namespace: ns-dpn-health-01
+
+image:
+  repository: persesdev/perses
+  tag: v0.53.1
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  name: dpn-perses-health
+  type: ClusterIP
+  port: 8083
+  targetPort: 8080
+  annotations: {}
+
+persistence:
+  enabled: true
+  name: dpn-perses-data
+  size: 8Gi
+  storageClassName: managed-premium
+  mountPath: /data
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

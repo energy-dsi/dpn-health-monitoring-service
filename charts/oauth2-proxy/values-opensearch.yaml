@@ -1,0 +1,61 @@
+# ===========================================================================
+# oauth2-proxy in front of OpenSearch Dashboards.
+#
+# The first UI moved off the nginx basic-auth proxy, and the reason the release
+# name is -osd rather than -opensearch: it predates the other seven. The nginx
+# chart has since been removed entirely.
+#
+# Only what genuinely differs per UI lives here — everything about Keycloak,
+# TLS and the session cookie policy is inherited from values.yaml.
+#
+# Deploy:
+#   helm upgrade --install dpn-oauth2-proxy-osd charts/oauth2-proxy \
+#     -n ns-dpn-health-01 -f charts/oauth2-proxy/values-opensearch.yaml
+#
+# Before the first login, https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601/oauth2/callback must be a
+# registered redirect URI on the `oauth2-proxy` Keycloak client. See README.md.
+# ===========================================================================
+
+name: dpn-oauth2-proxy-osd
+
+# OpenSearch Dashboards stays a ClusterIP Service, reachable only from inside
+# the namespace. The trailing slash is required by oauth2-proxy.
+upstream:
+  url: "http://dpn-opensearch-dashboard-health.ns-dpn-health-01.svc.cluster.local:5601/"
+
+# The address users browse to: the namespace's single static internal LB IP,
+# on the port nginx used to serve this UI.
+#
+# https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601/oauth2/callback MUST be registered as a redirect
+# URI on the `oauth2-proxy` client — the realm JSON in this repo only lists the
+# localhost:5601 callback used by docker-compose.
+externalUrl: "https://dpn-observability.ns-dpn-health-01.svc.cluster.local:5601"
+
+# The whole keycloak block — publicUrl, internalUrl, issuerUrl, realm,
+# clientId, allowedRoles — is inherited from values.yaml. Every proxy talks to
+# the same Keycloak with the same client, so nothing about it varies per UI.
+
+cookie:
+  # Distinct per UI so sessions for different proxies cannot overwrite each
+  # other when they share a hostname.
+  name: _oauth2_proxy_osd
+
+service:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  # Same port nginx served OpenSearch Dashboards on, so existing bookmarks
+  # keep working — only the scheme changes (http -> https) and the login
+  # changes from basic auth to Keycloak.
+  port: 5601
+  # The namespace's one static internal IP, shared with the nginx Service that
+  # still fronts the other UIs. This only works because port 5601 was retired
+  # from nginx — two Services may share the address, never the same port.
+  loadBalancerIP: <<your specific value>>
+
+# The existing wildcard/health TLS Secret already in ns-dpn-health-01. Carries
+# tls.crt + tls.key for the browser and ca.crt for verifying Keycloak.
+tlsSecretName: dpn-health-tls
+
+# secret.cookieName defaults to dpn-oauth2-proxy-osd-cookie — per release,
+# since the session key must NOT be shared between proxies.

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.name }}
+spec:
+  # ClusterIP only — this is an in-cluster dependency of the oauth2-proxy
+  # releases, never a browser-facing address, so it never needs a
+  # LoadBalancer or any port on the shared 10.226.121.10 address.
+  type: ClusterIP
+  selector:
+    app: {{ .Values.name }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379

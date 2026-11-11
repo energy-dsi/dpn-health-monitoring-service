@@ -1,0 +1,5 @@
+opensearchOidc:
+  akv:
+    keyvaultName: <<your specific value>>
+    tenantId: <<your specific value>>
+    userAssignedIdentityID: "<<your specific value>>"
